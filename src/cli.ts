@@ -27,9 +27,12 @@ const HELP = `prose - compile markdown into code
   prose status          show md changes since the last build
   prose check           exit 1 if md files changed since the last build (no LLM call)
 
-env: DEEPSEEK_API_KEY (or PROSE_API_KEY), PROSE_MODEL (default deepseek-chat),
+env: DEEPSEEK_API_KEY (or PROSE_API_KEY), PROSE_MODEL (default deepseek-flash),
      PROSE_BASE_URL (default https://api.deepseek.com),
-     PROSE_IMAGE (sandbox image, default ubuntu:24.04)`;
+     PROSE_IMAGE (sandbox image, default ubuntu:24.04),
+     PROSE_HISTORY_LIMIT (start of build: compact the saved conversation above this many chars, default 500000),
+     PROSE_HISTORY_MAX (during a build: compact as soon as the conversation exceeds this, default 800000),
+     PROSE_HISTORY_TARGET (chars a compaction brings it down to, default 100000)`;
 
 const printIssues = (issues: Issue[]) => {
   if (!issues.length) return;
@@ -84,10 +87,13 @@ async function main() {
     const r = await build({
       root,
       apiKey,
-      model: process.env.PROSE_MODEL ?? "deepseek-chat",
+      model: process.env.PROSE_MODEL ?? "deepseek-flash",
       baseURL: process.env.PROSE_BASE_URL ?? "https://api.deepseek.com",
       dry: flags.includes("--dry"),
       fresh: flags.includes("--fresh"),
+      historyLimit: process.env.PROSE_HISTORY_LIMIT ? Number(process.env.PROSE_HISTORY_LIMIT) : undefined,
+      historyMax: process.env.PROSE_HISTORY_MAX ? Number(process.env.PROSE_HISTORY_MAX) : undefined,
+      historyTarget: process.env.PROSE_HISTORY_TARGET ? Number(process.env.PROSE_HISTORY_TARGET) : undefined,
       params,
       instruction: words.join(" ").trim() || undefined,
       image: process.env.PROSE_IMAGE ?? "ubuntu:24.04",

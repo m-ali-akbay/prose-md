@@ -5,7 +5,7 @@ import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
 import { History, Msg, OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 7;
+export const PROMPT_VERSION = 10;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -90,6 +90,12 @@ export interface BuildOptions {
   image: string;
   maxTurns?: number;
   dry?: boolean;
+  /** at the START of a build, compact the saved conversation if it exceeds this many chars (default 500000) */
+  historyLimit?: number;
+  /** DURING a build, compact as soon as the conversation exceeds this many chars (default 800000) */
+  historyMax?: number;
+  /** size (chars) a compaction brings the conversation down to (default 100000) */
+  historyTarget?: number;
   /** ignore the saved conversation and start from scratch */
   fresh?: boolean;
   /** key=value build parameters; merged over the previous build's (empty value removes) */
@@ -168,20 +174,60 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       changes.patch,
     ].join("\n");
 
+    const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
+    const target = o.historyTarget ?? 100_000;
+    const maxChars = o.historyMax ?? 800_000;
     const key = hash(JSON.stringify([o.model, SYSTEM, tools]));
-    const prior = !o.fresh && snap.history?.key === key ? snap.history.builds : [];
-    const priorMsgs = prior.flat() as OpenAI.Chat.ChatCompletionMessageParam[];
+    let prior: Msg[][] = !o.fresh && snap.history?.key === key ? snap.history.builds : [];
+    // Compaction happens here, at the START of a build, so history.json is never trimmed needlessly.
+    prior = await compactHistory(client, o.model, prior, o.historyLimit ?? 500_000, target, log);
+    let priorMsgs = prior.flat() as OpenAI.Chat.ChatCompletionMessageParam[];
+    let compactions = 0;
     if (prior.length) log(`history: continuing ${prior.length} earlier build(s)`);
     const intro = prior.length
       ? "A new build starts. The container is new (nothing installed earlier remains) and /work was recreated from out/.\n\n"
       : "";
-    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+    let messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: "system", content: SYSTEM },
       ...priorMsgs,
       { role: "user", content: intro + first },
     ];
-    const startIdx = 1 + priorMsgs.length;
-    const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
+    let startIdx = 1 + priorMsgs.length;
+    const sizeOf = (ms: unknown[]) => JSON.stringify(ms).length;
+
+    /**
+     * Shrink the live conversation to about `target` chars: the newest messages of this build stay raw
+     * (starting at an assistant message so tool calls keep their results); the task message of this
+     * build is kept; everything before is replaced by a model-written summary.
+     */
+    async function compactInBuild(reason: string): Promise<boolean> {
+      const first = messages[startIdx] as Msg;
+      const cur = messages.slice(startIdx + 1) as Msg[];
+      const budget = Math.max(0, target - SUMMARY_RESERVE - sizeOf([first]));
+      let cut = cur.length;
+      let used = 0;
+      for (let i = cur.length - 1; i >= 0; i--) {
+        used += sizeOf([cur[i]]);
+        if (used > budget && cut < cur.length) break;
+        if (cur[i].role === "assistant") cut = i;
+      }
+      const head = cur.slice(0, cut);
+      const tail = cur.slice(cut);
+      const older = [...prior, ...(head.length ? [head.map(slim)] : [])];
+      if (older.length === 0) return false;
+      log(`history: ${reason}; summarizing ${prior.length} earlier build(s)${head.length ? " and the first part of this build" : ""}`);
+      const summaryText = (await summarize(client, o.model, older))[0].content;
+      messages = [
+        { role: "system", content: SYSTEM },
+        { role: "user", content: `${summaryText}\n\n---\n\n${first.content}` },
+        ...(tail as OpenAI.Chat.ChatCompletionMessageParam[]),
+      ];
+      prior = [];
+      priorMsgs = [];
+      startIdx = 1;
+      compactions++;
+      return true;
+    }
     const maxTurns = o.maxTurns ?? 150;
     let nudged = false;
     let ended: { kind: "finish"; summary: string } | { kind: "fail"; reason: string } | undefined;
@@ -190,7 +236,18 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       if (turn === maxTurns - 15) {
         messages.push({ role: "user", content: "You are running out of turns. Stop refining, call finish within a few turns." });
       }
-      const res = await client.chat.completions.create({ model: o.model, messages, tools });
+      if (compactions < 5 && sizeOf(messages) > maxChars) await compactInBuild(`conversation exceeds ${maxChars} chars`);
+      let res: OpenAI.Chat.ChatCompletion;
+      try {
+        res = await client.chat.completions.create({ model: o.model, messages, tools });
+      } catch (e) {
+        // Context window exceeded despite the limits: compact now and retry.
+        if (isContextError(e) && compactions < 5 && (await compactInBuild("context window exceeded"))) {
+          turn--;
+          continue;
+        }
+        throw e;
+      }
       const u = res.usage as any;
       if (u) {
         usage.prompt += u.prompt_tokens ?? 0;
@@ -267,7 +324,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       mds,
       outputs: Object.fromEntries(Object.entries(next).map(([f, v]) => [f, hash(v.data)])),
       meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString(), params },
-      history: { key, builds: trimHistory([...prior, messages.slice(startIdx).map(slim)]) },
+      history: { key, builds: [...prior, messages.slice(startIdx).map(slim)] },
     });
     await fs.writeFile(path.join(staging, "state", "report.json"), report({ status: "built", summary, written, deleted }));
     const stateDir = path.join(o.root, STATE_DIR);
@@ -289,23 +346,90 @@ function slim(m: Msg): Msg {
   return m;
 }
 
-const HISTORY_LIMIT = 200_000; // chars (~50k tokens)
-const HISTORY_TARGET = 120_000;
+const histSize = (b: Msg[][]) => JSON.stringify(b).length;
 
-/** Bound history size. Trimming in big steps keeps the prefix (and cache) stable between trims. */
-function trimHistory(builds: Msg[][]): Msg[][] {
-  const size = (b: Msg[][]) => JSON.stringify(b).length;
-  if (size(builds) <= HISTORY_LIMIT) return builds;
+const SUMMARY_SYSTEM = `You maintain the memory of "prose", a compiler that turns markdown specs into code. You are given transcripts of earlier build sessions (an agent working in a container). Write a summary for your future self, who will continue this project in later builds without seeing these transcripts. Cover: project structure and what each spec maps to, design decisions and their rationale, assumptions made, issues raised, toolchain/test quirks and the commands that worked (install, build, test), pitfalls hit and how they were fixed, and anything left pending. Be concrete and concise (at most ~1500 words). Do not paste file contents. Output only the summary.`;
+
+function isContextError(e: unknown): boolean {
+  const err = e as { status?: number; message?: string };
+  return err?.status === 400 && /context|maximum|too long|too many tokens/i.test(err.message ?? "");
+}
+
+/** Fold earlier builds into one summary exchange, written by the model itself. */
+async function summarize(client: OpenAI, model: string, builds: Msg[][]): Promise<Msg[]> {
+  const render = (m: Msg) => {
+    if (m.role === "user") return `USER:\n${m.content}`;
+    if (m.role === "assistant") {
+      const calls = (m.tool_calls ?? []).map((c: any) => `  [${c.function.name}] ${String(c.function.arguments).slice(0, 800)}`).join("\n");
+      return `ASSISTANT:\n${m.content ?? ""}\n${calls}`;
+    }
+    if (m.role === "tool") return `TOOL RESULT:\n${String(m.content).slice(0, 800)}`;
+    return "";
+  };
+  const parts = builds.map((b, i) => `### Build ${i + 1}\n${b.map(render).join("\n")}`);
+  let text = parts.join("\n\n");
+  while (text.length > 300_000 && parts.length > 1) {
+    parts.shift(); // too much to summarize at once: the oldest builds are the least relevant
+    text = parts.join("\n\n");
+  }
+  if (text.length > 300_000) text = text.slice(-300_000);
+  const res = await client.chat.completions.create({
+    model,
+    messages: [{ role: "system", content: SUMMARY_SYSTEM }, { role: "user", content: text }],
+  });
+  const summary = res.choices[0].message.content?.trim() ?? "";
+  if (!summary) throw new Error("empty summary");
+  return [
+    { role: "user", content: `[Summary of earlier work, written by you]\n\n${summary}` },
+    { role: "assistant", content: "Understood. I will treat this as background and re-verify against /work and the specs." },
+  ];
+}
+
+const SUMMARY_RESERVE = 15_000; // chars set aside for the summary within the target
+
+/**
+ * Once the history exceeds `limit` chars, compact it down to about `target`: the newest builds stay
+ * raw as long as they fit, everything older is replaced by a model-written summary. Summaries are
+ * stored, so the prefix stays stable (cache-friendly) until the next compaction.
+ * Falls back to trimming tool outputs if summarizing fails.
+ */
+async function compactHistory(client: OpenAI, model: string, builds: Msg[][], limit: number, target: number, log: (s: string) => void): Promise<Msg[][]> {
+  if (histSize(builds) <= limit) return builds;
+  const budget = Math.max(0, target - SUMMARY_RESERVE);
+  let keep = 0;
+  let used = 0;
+  for (let i = builds.length - 1; i >= 0; i--) {
+    const sz = histSize([builds[i]]);
+    if (used + sz > budget) break;
+    used += sz;
+    keep++;
+  }
+  const older = builds.slice(0, builds.length - keep);
+  const raw = builds.slice(builds.length - keep);
+  if (older.length) {
+    try {
+      const sum = await summarize(client, model, older);
+      log(`history: summarized ${older.length} older build(s), kept ${raw.length} raw`);
+      builds = [sum, ...raw];
+    } catch (e) {
+      log(`history: summarizing failed (${(e as Error).message}); trimming instead`);
+    }
+  }
+  return histSize(builds) <= limit ? builds : trimHistory(builds, target);
+}
+
+/** Last resort: truncate old tool outputs, then drop the oldest builds. */
+function trimHistory(builds: Msg[][], target: number): Msg[][] {
   builds = builds.map((b) => b.map((m) => ({ ...m })));
   outer: for (let i = 0; i < builds.length - 1; i++) {
     for (const m of builds[i]) {
       if (m.role === "tool" && typeof m.content === "string" && m.content.length > 300) {
         m.content = m.content.slice(0, 200) + "\n[output trimmed]";
-        if (size(builds) <= HISTORY_TARGET) break outer;
+        if (histSize(builds) <= target) break outer;
       }
     }
   }
-  while (size(builds) > HISTORY_TARGET && builds.length > 1) builds.shift();
+  while (histSize(builds) > target && builds.length > 1) builds.shift();
   return builds;
 }
 
