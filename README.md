@@ -8,6 +8,8 @@ export DEEPSEEK_API_KEY=...   # or put it in .env
 npx tsx src/cli.ts build      # run inside a project containing .md specs
 ```
 
+**History:** the model's conversation is saved in `.prose/history.json` and each build continues it (better cache hits, the model remembers its earlier decisions). It is replaced atomically with `out/`, dropped when a build fails, reset when the model, system prompt or tool schema changes, trimmed when it grows past ~50k tokens, and ignored with `--fresh`. Token usage incl. cache hits is printed and stored in `report.json`. Add `.prose/history.json` to your `.gitignore`: it is large and not mergeable.
+
 Commands: `build [--dry] [--no-sandbox]`, `status`, `check`.
 
 **Sandbox:** the agent works inside a disposable Docker container (root, network access, `/work` mirrors `out/`). It can install any toolchain, build, run tests and fix failures before finishing, so any language or stack works. Requires Docker; image via `PROSE_IMAGE` (default `ubuntu:24.04`). `--no-sandbox` disables command execution. Model via `PROSE_MODEL` (`deepseek-reasoner` is better for harder projects).

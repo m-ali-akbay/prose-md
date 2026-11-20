@@ -1,3 +1,5 @@
 node_modules
 dist
 .env
+**/.prose/history.json
+**/.prose-staging

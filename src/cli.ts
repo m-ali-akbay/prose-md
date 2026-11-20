@@ -16,9 +16,10 @@ async function loadDotEnv(root: string) {
 
 const HELP = `prose - compile markdown into code
 
-  prose build [--dry] [--param key=value]... ["instruction"]
+  prose build [--dry] [--fresh] [--param key=value]... ["instruction"]
                         compile md changes into out/. The agent works in a root
                         Docker container (build, test, install anything).
+                        --fresh: ignore the saved model conversation (.prose/history.json).
                         --param: build parameters given to the agent (target, env, ...).
                           Remembered across builds; changing one triggers a rebuild;
                           --param key= removes it.
@@ -86,6 +87,7 @@ async function main() {
       model: process.env.PROSE_MODEL ?? "deepseek-chat",
       baseURL: process.env.PROSE_BASE_URL ?? "https://api.deepseek.com",
       dry: flags.includes("--dry"),
+      fresh: flags.includes("--fresh"),
       params,
       instruction: words.join(" ").trim() || undefined,
       image: process.env.PROSE_IMAGE ?? "ubuntu:24.04",

@@ -9,7 +9,17 @@ const IGNORED = new Set(["node_modules", STATE_DIR, STAGING_DIR, OUT_DIR, ".git"
 
 export const hash = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
 
+export type Msg = Record<string, any>;
+/** Model conversation kept across builds so each build continues the previous ones. */
+export interface History {
+  /** identifies model + system prompt + tool schema; history is discarded when it changes */
+  key: string;
+  /** one entry per build: that build's messages (everything after the system prompt) */
+  builds: Msg[][];
+}
+
 export interface Snapshot {
+  history?: History;
   /** md files as of the last successful build (relative path -> content) */
   mds: Record<string, string>;
   /** output files as of the last successful build (relative to out/ -> sha256) */
@@ -71,6 +81,9 @@ export async function loadSnapshot(root: string): Promise<Snapshot> {
     snap.outputs = lock.outputs ?? {};
     snap.meta = lock.meta ?? {};
   } catch {}
+  try {
+    snap.history = JSON.parse(await fs.readFile(path.join(state, "history.json"), "utf8"));
+  } catch {}
   const mdBase = path.join(state, "md");
   for (const f of await walk(mdBase, mdBase, () => true, false)) {
     snap.mds[f] = await fs.readFile(path.join(mdBase, f), "utf8");
@@ -86,6 +99,7 @@ export async function saveSnapshot(state: string, snap: Snapshot): Promise<void>
     await fs.writeFile(p, content);
   }
   await fs.mkdir(state, { recursive: true });
+  if (snap.history) await fs.writeFile(path.join(state, "history.json"), JSON.stringify(snap.history));
   await fs.writeFile(
     path.join(state, "lock.json"),
     JSON.stringify({ meta: snap.meta, outputs: snap.outputs }, null, 2) + "\n",

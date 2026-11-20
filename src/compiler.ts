@@ -3,9 +3,9 @@ import path from "node:path";
 import OpenAI from "openai";
 import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
-import { OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
+import { History, Msg, OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 6;
+export const PROMPT_VERSION = 7;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -27,7 +27,7 @@ Rules:
 - Build and run the tests you wrote and fix failures before finishing.
 - Use raise (as often as you like) to report things the author should know, with a severity: "info" (a notable decision), "warning" (an ambiguity you resolved by assuming something, a spec smell, a risk, a test you could not make pass), "error" (something is wrong but you could still finish). Raised issues are recorded in the build report; raising does not stop the build. Reference the spec file and line in the location field when you can.
 - If the specs are contradictory or too ambiguous to implement without guessing something important, call fail with a short explanation of what the author must fix. Nothing is applied then.
-- You have no memory between builds except what is in /work. If it helps your future self (structure, design decisions, assumptions, which spec maps to which files), keep notes in a file inside /work (e.g. NOTES.md) and keep them current; otherwise don't bother.
+- Your conversation from earlier builds may precede this one. Treat it as background only: the container is brand new each build (toolchains and packages you installed before are gone) and earlier tool outputs may be stale, so re-read files before relying on them. /work and the specs are the only truth.
 - If the build prompt contains an "Instruction for this build" section, follow it for this build only (it is not part of the specs and will not be remembered).
 - Nothing is applied until you call finish. Every build must end with exactly one of finish or fail.`;
 
@@ -90,6 +90,8 @@ export interface BuildOptions {
   image: string;
   maxTurns?: number;
   dry?: boolean;
+  /** ignore the saved conversation and start from scratch */
+  fresh?: boolean;
   /** key=value build parameters; merged over the previous build's (empty value removes) */
   params?: Record<string, string>;
   /** one-off free-text instruction for this build only */
@@ -124,7 +126,8 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
   const handEdited = [...d.modified, ...d.missing, ...d.extra].sort();
 
   const issues: Issue[] = [];
-  const report = (r: object) => JSON.stringify({ model: o.model, at: new Date().toISOString(), params, ...(o.instruction ? { instruction: o.instruction } : {}), issues, ...r }, null, 2) + "\n";
+  const usage = { prompt: 0, cached: 0, completion: 0 };
+  const report = (r: object) => JSON.stringify({ model: o.model, at: new Date().toISOString(), params, ...(o.instruction ? { instruction: o.instruction } : {}), tokens: usage, issues, ...r }, null, 2) + "\n";
   const failed = async (reason: string): Promise<BuildResult> => {
     if (!o.dry) {
       // out/ and the snapshot stay as they were; only the report is updated
@@ -165,10 +168,19 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       changes.patch,
     ].join("\n");
 
+    const key = hash(JSON.stringify([o.model, SYSTEM, tools]));
+    const prior = !o.fresh && snap.history?.key === key ? snap.history.builds : [];
+    const priorMsgs = prior.flat() as OpenAI.Chat.ChatCompletionMessageParam[];
+    if (prior.length) log(`history: continuing ${prior.length} earlier build(s)`);
+    const intro = prior.length
+      ? "A new build starts. The container is new (nothing installed earlier remains) and /work was recreated from out/.\n\n"
+      : "";
     const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
       { role: "system", content: SYSTEM },
-      { role: "user", content: first },
+      ...priorMsgs,
+      { role: "user", content: intro + first },
     ];
+    const startIdx = 1 + priorMsgs.length;
     const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
     const maxTurns = o.maxTurns ?? 150;
     let nudged = false;
@@ -179,6 +191,12 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
         messages.push({ role: "user", content: "You are running out of turns. Stop refining, call finish within a few turns." });
       }
       const res = await client.chat.completions.create({ model: o.model, messages, tools });
+      const u = res.usage as any;
+      if (u) {
+        usage.prompt += u.prompt_tokens ?? 0;
+        usage.cached += u.prompt_cache_hit_tokens ?? u.prompt_tokens_details?.cached_tokens ?? 0;
+        usage.completion += u.completion_tokens ?? 0;
+      }
       const msg = res.choices[0].message;
       messages.push(msg as OpenAI.Chat.ChatCompletionMessageParam);
       if (msg.content) log(msg.content.trim());
@@ -221,6 +239,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       }
     }
 
+    log(`tokens: prompt ${usage.prompt} (cache hit ${usage.cached}), completion ${usage.completion}`);
     if (!ended) return failed(`no finish or fail after ${maxTurns} turns; nothing written`);
     if (ended.kind === "fail") return failed(ended.reason);
     const summary = ended.summary;
@@ -248,6 +267,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       mds,
       outputs: Object.fromEntries(Object.entries(next).map(([f, v]) => [f, hash(v.data)])),
       meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString(), params },
+      history: { key, builds: trimHistory([...prior, messages.slice(startIdx).map(slim)]) },
     });
     await fs.writeFile(path.join(staging, "state", "report.json"), report({ status: "built", summary, written, deleted }));
     const stateDir = path.join(o.root, STATE_DIR);
@@ -261,6 +281,32 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
   } finally {
     await sb.destroy();
   }
+}
+
+/** Keep only what is needed to replay a message (drops reasoning_content etc.). */
+function slim(m: Msg): Msg {
+  if (m.role === "assistant") return { role: "assistant", content: m.content ?? null, ...(m.tool_calls?.length ? { tool_calls: m.tool_calls } : {}) };
+  return m;
+}
+
+const HISTORY_LIMIT = 200_000; // chars (~50k tokens)
+const HISTORY_TARGET = 120_000;
+
+/** Bound history size. Trimming in big steps keeps the prefix (and cache) stable between trims. */
+function trimHistory(builds: Msg[][]): Msg[][] {
+  const size = (b: Msg[][]) => JSON.stringify(b).length;
+  if (size(builds) <= HISTORY_LIMIT) return builds;
+  builds = builds.map((b) => b.map((m) => ({ ...m })));
+  outer: for (let i = 0; i < builds.length - 1; i++) {
+    for (const m of builds[i]) {
+      if (m.role === "tool" && typeof m.content === "string" && m.content.length > 300) {
+        m.content = m.content.slice(0, 200) + "\n[output trimmed]";
+        if (size(builds) <= HISTORY_TARGET) break outer;
+      }
+    }
+  }
+  while (size(builds) > HISTORY_TARGET && builds.length > 1) builds.shift();
+  return builds;
 }
 
 function sortKeys(o: Record<string, string>) {
