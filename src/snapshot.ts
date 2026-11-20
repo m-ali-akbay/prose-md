@@ -95,7 +95,7 @@ export async function loadSnapshot(root: string): Promise<Snapshot> {
     snap.meta = lock.meta ?? {};
   } catch {}
   try {
-    snap.history = JSON.parse(await fs.readFile(path.join(state, "history.json"), "utf8"));
+    snap.history = JSON.parse(await fs.readFile(path.join(state, "cache.json"), "utf8"));
   } catch {}
   const mdBase = path.join(state, "md");
   for (const f of await walk(mdBase, mdBase, () => true, false)) {
@@ -112,7 +112,7 @@ export async function saveSnapshot(state: string, snap: Snapshot): Promise<void>
     await fs.writeFile(p, content);
   }
   await fs.mkdir(state, { recursive: true });
-  if (snap.history) await fs.writeFile(path.join(state, "history.json"), JSON.stringify(snap.history));
+  if (snap.history) await fs.writeFile(path.join(state, "cache.json"), JSON.stringify(snap.history));
   await fs.writeFile(
     path.join(state, "lock.json"),
     JSON.stringify({ meta: snap.meta, outputs: snap.outputs, ...(Object.keys(snap.assets).length ? { assets: snap.assets } : {}) }, null, 2) + "\n",

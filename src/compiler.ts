@@ -206,7 +206,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     const maxChars = o.historyMax ?? 800_000;
     const key = hash(JSON.stringify([o.model, SYSTEM, tools]));
     let prior: Msg[][] = !o.fresh && snap.history?.key === key ? snap.history.builds : [];
-    // Compaction happens here, at the START of a build, so history.json is never trimmed needlessly.
+    // Compaction happens here, at the START of a build, so cache.json is never trimmed needlessly.
     prior = await compactHistory(client, o.model, effort, prior, o.historyLimit ?? 500_000, target, log);
     let priorMsgs = prior.flat() as OpenAI.Chat.ChatCompletionMessageParam[];
     let compactions = 0;

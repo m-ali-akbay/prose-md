@@ -59,7 +59,7 @@ Files are written read-only. `prose check` fails if `out/` was changed by hand. 
 Put images next to your specs (UI mockups, diagrams, screenshots; `.png .jpg .jpeg .gif .webp`, anywhere in the project except `out/`, `.prose/`, `node_modules`). They are copied into `/specs`, listed in the agent's first message, and the agent looks at them with `view_image`. It can also look at its own results: render the output in the container (headless browser screenshot, a generated chart, ...) and view that.
 
 - Image changes count like spec changes: their hashes are in `lock.json`, a changed, added or deleted image triggers a rebuild and is shown by `status` and `check`.
-- Images are not kept in `history.json` (replaced by a placeholder), and count as ~1000 tokens each toward the compaction limits instead of their base64 size.
+- Images are not kept in `cache.json` (replaced by a placeholder), and count as ~1000 tokens each toward the compaction limits instead of their base64 size.
 - Needs a vision-capable model (`deepseek-flash` is). Only tested against DeepSeek.
 
 ## CI mode: `prose check`
@@ -83,13 +83,13 @@ Commit `.prose/` and `out/` together with the specs, then in CI, for example:
 
 ## History
 
-The model's conversation is saved in `.prose/history.json` and each build continues it (better cache hits; the model remembers its earlier decisions). It is replaced atomically with `out/`, dropped when a build fails, reset when the model, system prompt or tool schema changes, and ignored with `--fresh`. Size knobs, in characters (about 3-4 per token):
+The model's conversation is saved in `.prose/cache.json` and each build continues it (better cache hits; the model remembers its earlier decisions). It is replaced atomically with `out/`, dropped when a build fails, reset when the model, system prompt or tool schema changes, and ignored with `--fresh`. Size knobs, in characters (about 3-4 per token):
 
-- `PROSE_HISTORY_LIMIT` (500000): at the **start** of a build, if the saved history is larger, it is compacted. `history.json` is written raw at the end of a build, so it is never trimmed needlessly.
+- `PROSE_HISTORY_LIMIT` (500000): at the **start** of a build, if the saved history is larger, it is compacted. `cache.json` is written raw at the end of a build, so it is never trimmed needlessly.
 - `PROSE_HISTORY_MAX` (800000): **during** a build, before each request, if the live conversation is larger, it is compacted on the spot. Also done if the model reports its context window exceeded.
 - `PROSE_HISTORY_TARGET` (100000): the size a compaction aims for. The newest messages stay raw as long as they fit; everything older (earlier builds and, mid-build, the early part of the current build) becomes a summary the model writes itself. The current build's task message is always kept. Summaries are stored, so the cached prefix stays stable until the next compaction.
 
-`.prose/history.json` is meant to be committed with the rest of `.prose/`, so a build on another machine or in CI continues the same conversation. It can get large (it is capped by the compaction knobs above) and is not mergeable: if two branches both build, resolve a conflict by keeping either side or deleting the file (the next build then starts a fresh conversation).
+`.prose/cache.json` is meant to be committed with the rest of `.prose/`, so a build on another machine or in CI continues the same conversation. It can get large (it is capped by the compaction knobs above) and is not mergeable: if two branches both build, resolve a conflict by keeping either side or deleting the file (the next build then starts a fresh conversation).
 
 ## Environment
 

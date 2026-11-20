@@ -21,7 +21,7 @@ const HELP = `prose - compile markdown into code
                         Docker container (build, test, install anything).
                         --effort: model thinking effort (default low; env PROSE_EFFORT).
                         --report: also write the build report (JSON) to FILE.
-                        --fresh: ignore the saved model conversation (.prose/history.json).
+                        --fresh: ignore the saved model conversation (.prose/cache.json).
                         --param: build parameters given to the agent (target, env, ...).
                           Remembered across builds; changing one triggers a rebuild;
                           --param key= removes it.
