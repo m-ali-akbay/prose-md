@@ -60,7 +60,7 @@ The model's conversation is saved in `.prose/history.json` and each build contin
 - `PROSE_HISTORY_MAX` (800000): **during** a build, before each request, if the live conversation is larger, it is compacted on the spot. Also done if the model reports its context window exceeded.
 - `PROSE_HISTORY_TARGET` (100000): the size a compaction aims for. The newest messages stay raw as long as they fit; everything older (earlier builds and, mid-build, the early part of the current build) becomes a summary the model writes itself. The current build's task message is always kept. Summaries are stored, so the cached prefix stays stable until the next compaction.
 
-Add `.prose/history.json` to your `.gitignore`: it is large and not mergeable.
+`.prose/history.json` is meant to be committed with the rest of `.prose/`, so a build on another machine or in CI continues the same conversation. It can get large (it is capped by the compaction knobs above) and is not mergeable: if two branches both build, resolve a conflict by keeping either side or deleting the file (the next build then starts a fresh conversation).
 
 ## Environment
 
