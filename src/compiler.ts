@@ -5,7 +5,7 @@ import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
 import { OUT_DIR, STAGING_DIR, STATE_DIR, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 3;
+export const PROMPT_VERSION = 4;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -25,9 +25,10 @@ Rules:
 - Files listed in hand-edited.txt were edited by hand; preserve their intent unless the specs contradict them.
 - Include whatever the specs imply (tests, build files, a README for the output) in /work.
 - Build and run the tests you wrote and fix failures before finishing.
-- If the specs are contradictory or too ambiguous to implement without guessing something important, call finish with error set to a short explanation of what the author must fix. Nothing is applied then. Resolve minor ambiguity yourself and document the assumption in /work.
+- Use raise (as often as you like) to report things the author should know, with a severity: "info" (a notable decision), "warning" (an ambiguity you resolved by assuming something, a spec smell, a risk, a test you could not make pass), "error" (something is wrong but you could still finish). Raised issues are recorded in the build report; raising does not stop the build. Reference the spec file and line in the location field when you can.
+- If the specs are contradictory or too ambiguous to implement without guessing something important, call fail with a short explanation of what the author must fix. Nothing is applied then.
 - You have no memory between builds except what is in /work. If it helps your future self (structure, design decisions, assumptions, which spec maps to which files), keep notes in a file inside /work (e.g. NOTES.md) and keep them current; otherwise don't bother.
-- Nothing is applied until you call finish.`;
+- Nothing is applied until you call finish. Every build must end with exactly one of finish or fail.`;
 
 const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
@@ -41,15 +42,40 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
   {
     type: "function",
     function: {
-      name: "finish",
-      description: "End the build. Without `error`, /work is applied to out/. With `error`, nothing is applied and the build fails.",
+      name: "raise",
+      description: "Record an issue in the build report. Can be called any number of times; does not stop the build.",
       parameters: {
         type: "object",
         properties: {
-          summary: { type: "string", description: "What was built or changed." },
-          error: { type: "string", description: "Set only if the build cannot proceed; explain what the author must fix." },
+          severity: { type: "string", enum: ["info", "warning", "error"] },
+          message: { type: "string" },
+          location: { type: "string", description: "Optional spec location, e.g. loans.md:12" },
         },
+        required: ["severity", "message"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "finish",
+      description: "Successfully end the build: /work is applied to out/.",
+      parameters: {
+        type: "object",
+        properties: { summary: { type: "string", description: "What was built or changed." } },
         required: ["summary"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "fail",
+      description: "Abort the build. Nothing is applied and out/ stays unchanged. Explain what the author must fix.",
+      parameters: {
+        type: "object",
+        properties: { reason: { type: "string" } },
+        required: ["reason"],
       },
     },
   },
@@ -66,10 +92,13 @@ export interface BuildOptions {
   log?: (s: string) => void;
 }
 
+export type Severity = "info" | "warning" | "error";
+export interface Issue { severity: Severity; message: string; location?: string }
+
 export type BuildResult =
   | { status: "unchanged" }
-  | { status: "failed"; reason: string }
-  | { status: "built"; summary: string; written: string[]; deleted: string[] };
+  | { status: "failed"; reason: string; issues: Issue[] }
+  | { status: "built"; summary: string; written: string[]; deleted: string[]; issues: Issue[] };
 
 export async function build(o: BuildOptions): Promise<BuildResult> {
   const log = o.log ?? (() => {});
@@ -84,6 +113,17 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
   const handEdited = Object.entries(current)
     .filter(([f, v]) => snap.outputs[f] !== undefined && snap.outputs[f] !== hash(v.data))
     .map(([f]) => f);
+
+  const issues: Issue[] = [];
+  const report = (r: object) => JSON.stringify({ model: o.model, at: new Date().toISOString(), issues, ...r }, null, 2) + "\n";
+  const failed = async (reason: string): Promise<BuildResult> => {
+    if (!o.dry) {
+      // out/ and the snapshot stay as they were; only the report is updated
+      await fs.mkdir(path.join(o.root, STATE_DIR), { recursive: true });
+      await fs.writeFile(path.join(o.root, STATE_DIR, "report.json"), report({ status: "failed", reason }));
+    }
+    return { status: "failed", reason, issues };
+  };
 
   const sb = await Sandbox.create();
   try {
@@ -120,9 +160,9 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
     const maxTurns = o.maxTurns ?? 150;
     let nudged = false;
-    let finished: { summary: string; error?: string } | undefined;
+    let ended: { kind: "finish"; summary: string } | { kind: "fail"; reason: string } | undefined;
 
-    for (let turn = 0; turn < maxTurns && !finished; turn++) {
+    for (let turn = 0; turn < maxTurns && !ended; turn++) {
       if (turn === maxTurns - 15) {
         messages.push({ role: "user", content: "You are running out of turns. Stop refining, call finish within a few turns." });
       }
@@ -133,9 +173,9 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
 
       const calls = (msg.tool_calls ?? []).filter((c) => c.type === "function");
       if (calls.length === 0) {
-        if (nudged) return { status: "failed", reason: "model stopped without calling finish" };
+        if (nudged) return failed("model stopped without calling finish or fail");
         nudged = true;
-        messages.push({ role: "user", content: "Continue using tools. Call finish when done." });
+        messages.push({ role: "user", content: "Continue using tools. Call finish when done, or fail if blocked." });
         continue;
       }
       for (const c of calls) {
@@ -145,9 +185,19 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
           if (c.function.name === "bash") {
             log(`  bash: ${String(args.command).split("\n")[0].slice(0, 160)}`);
             out = await sb.exec(String(args.command ?? ""));
+          } else if (c.function.name === "raise") {
+            const sev = ["info", "warning", "error"].includes(args.severity) ? (args.severity as Severity) : "warning";
+            const issue: Issue = { severity: sev, message: String(args.message ?? ""), ...(args.location ? { location: String(args.location) } : {}) };
+            issues.push(issue);
+            log(`  raise ${sev}: ${issue.message.slice(0, 160)}`);
+            out = `recorded (#${issues.length})`;
           } else if (c.function.name === "finish") {
-            finished = { summary: String(args.summary ?? ""), error: args.error ? String(args.error) : undefined };
+            ended = { kind: "finish", summary: String(args.summary ?? "") };
             log("  finish");
+            out = "ok";
+          } else if (c.function.name === "fail") {
+            ended = { kind: "fail", reason: String(args.reason ?? "") };
+            log("  fail");
             out = "ok";
           } else {
             out = `error: unknown tool ${c.function.name}`;
@@ -159,8 +209,9 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       }
     }
 
-    if (!finished) return { status: "failed", reason: `no finish after ${maxTurns} turns; nothing written` };
-    if (finished.error) return { status: "failed", reason: finished.error };
+    if (!ended) return failed(`no finish or fail after ${maxTurns} turns; nothing written`);
+    if (ended.kind === "fail") return failed(ended.reason);
+    const summary = ended.summary;
 
     // apply /work -> out/
     await sb.chown();
@@ -169,7 +220,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       a.mode === b.mode && a.data.equals(b.data);
     const written = Object.keys(next).filter((f) => !current[f] || !same(current[f], next[f]));
     const deleted = Object.keys(current).filter((f) => !(f in next));
-    if (o.dry) return { status: "built", summary: finished.summary, written, deleted };
+    if (o.dry) return { status: "built", summary, written, deleted, issues };
 
     // Stage the complete new out/ and .prose/ side by side, then swap both in.
     const staging = path.join(o.root, STAGING_DIR);
@@ -186,6 +237,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       outputs: Object.fromEntries(Object.entries(next).map(([f, v]) => [f, hash(v.data)])),
       meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString() },
     });
+    await fs.writeFile(path.join(staging, "state", "report.json"), report({ status: "built", summary, written, deleted }));
     const stateDir = path.join(o.root, STATE_DIR);
     await fs.rm(path.join(staging, "old-out"), { recursive: true, force: true });
     await fs.rename(outBase, path.join(staging, "old-out")).catch(() => {});
@@ -193,7 +245,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     await fs.rename(stateDir, path.join(staging, "old-state")).catch(() => {});
     await fs.rename(path.join(staging, "state"), stateDir);
     await fs.rm(staging, { recursive: true, force: true });
-    return { status: "built", summary: finished.summary, written, deleted };
+    return { status: "built", summary, written, deleted, issues };
   } finally {
     await sb.destroy();
   }
