@@ -5,7 +5,7 @@ import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
 import { History, Msg, OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 11;
+export const PROMPT_VERSION = 12;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -97,6 +97,8 @@ export interface BuildOptions {
   historyMax?: number;
   /** size (chars) a compaction brings the conversation down to (default 100000) */
   historyTarget?: number;
+  /** thinking effort sent to the model as reasoning_effort (default "low") */
+  effort?: Effort;
   /** ignore the saved conversation and start from scratch */
   fresh?: boolean;
   /** key=value build parameters; merged over the previous build's (empty value removes) */
@@ -106,6 +108,7 @@ export interface BuildOptions {
   log?: (s: string) => void;
 }
 
+export type Effort = "low" | "high" | "max";
 export type Severity = "info" | "warning" | "error";
 export interface Issue { severity: Severity; message: string; location?: string }
 
@@ -134,7 +137,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
 
   const issues: Issue[] = [];
   const usage = { prompt: 0, cached: 0, completion: 0 };
-  const report = (r: object) => JSON.stringify({ model: o.model, at: new Date().toISOString(), params, ...(o.instruction ? { instruction: o.instruction } : {}), tokens: usage, issues, ...r }, null, 2) + "\n";
+  const report = (r: object) => JSON.stringify({ model: o.model, effort: o.effort ?? "low", at: new Date().toISOString(), params, ...(o.instruction ? { instruction: o.instruction } : {}), tokens: usage, issues, ...r }, null, 2) + "\n";
   const failed = async (reason: string): Promise<BuildResult> => {
     if (!o.dry) {
       // out/ and the snapshot stay as they were; only the report is updated
@@ -176,12 +179,13 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     ].join("\n");
 
     const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
+    const effort: Effort = o.effort ?? "low";
     const target = o.historyTarget ?? 100_000;
     const maxChars = o.historyMax ?? 800_000;
     const key = hash(JSON.stringify([o.model, SYSTEM, tools]));
     let prior: Msg[][] = !o.fresh && snap.history?.key === key ? snap.history.builds : [];
     // Compaction happens here, at the START of a build, so history.json is never trimmed needlessly.
-    prior = await compactHistory(client, o.model, prior, o.historyLimit ?? 500_000, target, log);
+    prior = await compactHistory(client, o.model, effort, prior, o.historyLimit ?? 500_000, target, log);
     let priorMsgs = prior.flat() as OpenAI.Chat.ChatCompletionMessageParam[];
     let compactions = 0;
     if (prior.length) log(`history: continuing ${prior.length} earlier build(s)`);
@@ -217,7 +221,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       const older = [...prior, ...(head.length ? [head.map(slim)] : [])];
       if (older.length === 0) return false;
       log(`history: ${reason}; summarizing ${prior.length} earlier build(s)${head.length ? " and the first part of this build" : ""}`);
-      const summaryText = (await summarize(client, o.model, older))[0].content;
+      const summaryText = (await summarize(client, o.model, older, effort))[0].content;
       messages = [
         { role: "system", content: SYSTEM },
         { role: "user", content: `${summaryText}\n\n---\n\n${first.content}` },
@@ -240,7 +244,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       if (compactions < 5 && sizeOf(messages) > maxChars) await compactInBuild(`conversation exceeds ${maxChars} chars`);
       let res: OpenAI.Chat.ChatCompletion;
       try {
-        res = await client.chat.completions.create({ model: o.model, messages, tools });
+        res = await client.chat.completions.create({ model: o.model, messages, tools, reasoning_effort: effort } as any) as OpenAI.Chat.ChatCompletion;
       } catch (e) {
         // Context window exceeded despite the limits: compact now and retry.
         if (isContextError(e) && compactions < 5 && (await compactInBuild("context window exceeded"))) {
@@ -357,7 +361,7 @@ function isContextError(e: unknown): boolean {
 }
 
 /** Fold earlier builds into one summary exchange, written by the model itself. */
-async function summarize(client: OpenAI, model: string, builds: Msg[][]): Promise<Msg[]> {
+async function summarize(client: OpenAI, model: string, builds: Msg[][], effort: Effort): Promise<Msg[]> {
   const render = (m: Msg) => {
     if (m.role === "user") return `USER:\n${m.content}`;
     if (m.role === "assistant") {
@@ -374,10 +378,11 @@ async function summarize(client: OpenAI, model: string, builds: Msg[][]): Promis
     text = parts.join("\n\n");
   }
   if (text.length > 300_000) text = text.slice(-300_000);
-  const res = await client.chat.completions.create({
+  const res = (await client.chat.completions.create({
     model,
     messages: [{ role: "system", content: SUMMARY_SYSTEM }, { role: "user", content: text }],
-  });
+    reasoning_effort: effort,
+  } as any)) as OpenAI.Chat.ChatCompletion;
   const summary = res.choices[0].message.content?.trim() ?? "";
   if (!summary) throw new Error("empty summary");
   return [
@@ -394,7 +399,7 @@ const SUMMARY_RESERVE = 15_000; // chars set aside for the summary within the ta
  * stored, so the prefix stays stable (cache-friendly) until the next compaction.
  * Falls back to trimming tool outputs if summarizing fails.
  */
-async function compactHistory(client: OpenAI, model: string, builds: Msg[][], limit: number, target: number, log: (s: string) => void): Promise<Msg[][]> {
+async function compactHistory(client: OpenAI, model: string, effort: Effort, builds: Msg[][], limit: number, target: number, log: (s: string) => void): Promise<Msg[][]> {
   if (histSize(builds) <= limit) return builds;
   const budget = Math.max(0, target - SUMMARY_RESERVE);
   let keep = 0;
@@ -409,7 +414,7 @@ async function compactHistory(client: OpenAI, model: string, builds: Msg[][], li
   const raw = builds.slice(builds.length - keep);
   if (older.length) {
     try {
-      const sum = await summarize(client, model, older);
+      const sum = await summarize(client, model, older, effort);
       log(`history: summarized ${older.length} older build(s), kept ${raw.length} raw`);
       builds = [sum, ...raw];
     } catch (e) {

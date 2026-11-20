@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { build, type Issue } from "./compiler.js";
+import { build, type Effort, type Issue } from "./compiler.js";
 import { diffMds, hasChanges } from "./diff.js";
 import { OUT_DIR, drift, loadSnapshot, readMds, readTree } from "./snapshot.js";
 
@@ -16,9 +16,10 @@ async function loadDotEnv(root: string) {
 
 const HELP = `prose - compile markdown into code
 
-  prose build [--dry] [--fresh] [--param key=value]... ["instruction"]
+  prose build [--dry] [--fresh] [--effort low|high|max] [--param key=value]... ["instruction"]
                         compile md changes into out/. The agent works in a root
                         Docker container (build, test, install anything).
+                        --effort: model thinking effort (default low; env PROSE_EFFORT).
                         --fresh: ignore the saved model conversation (.prose/history.json).
                         --param: build parameters given to the agent (target, env, ...).
                           Remembered across builds; changing one triggers a rebuild;
@@ -45,6 +46,7 @@ async function main() {
   const flags: string[] = [];
   const params: Record<string, string> = {};
   const words: string[] = [];
+  let effortArg: string | undefined;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === "--param" || a.startsWith("--param=")) {
@@ -55,6 +57,8 @@ async function main() {
         process.exit(1);
       }
       params[kv.slice(0, eq)] = kv.slice(eq + 1);
+    } else if (a === "--effort" || a.startsWith("--effort=")) {
+      effortArg = a === "--effort" ? rest[++i] : a.slice("--effort=".length);
     } else if (a.startsWith("--")) flags.push(a);
     else words.push(a);
   }
@@ -79,6 +83,11 @@ async function main() {
   }
 
   if (cmd === "build") {
+    const effort = effortArg ?? process.env.PROSE_EFFORT ?? "low";
+    if (!["low", "high", "max"].includes(effort)) {
+      console.error(`bad effort "${effort}", expected low, high or max`);
+      process.exit(1);
+    }
     const apiKey = process.env.PROSE_API_KEY ?? process.env.DEEPSEEK_API_KEY;
     if (!apiKey) {
       console.error("Set DEEPSEEK_API_KEY (env or .env file).");
@@ -91,6 +100,7 @@ async function main() {
       baseURL: process.env.PROSE_BASE_URL ?? "https://api.deepseek.com",
       dry: flags.includes("--dry"),
       fresh: flags.includes("--fresh"),
+      effort: effort as Effort,
       historyLimit: process.env.PROSE_HISTORY_LIMIT ? Number(process.env.PROSE_HISTORY_LIMIT) : undefined,
       historyMax: process.env.PROSE_HISTORY_MAX ? Number(process.env.PROSE_HISTORY_MAX) : undefined,
       historyTarget: process.env.PROSE_HISTORY_TARGET ? Number(process.env.PROSE_HISTORY_TARGET) : undefined,

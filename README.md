@@ -14,13 +14,14 @@ Requires Docker. The target language, frameworks and layout come from the specs 
 ## Commands
 
 ```
-prose build [--dry] [--fresh] [--param key=value]... ["instruction"]
+prose build [--dry] [--fresh] [--effort low|high|max] [--param key=value]... ["instruction"]
 prose status     md changes since the last build, and hand edits in out/
 prose check      exit 1 if md files changed or out/ was edited by hand (no LLM call)
 ```
 
 - `--dry`: run the build but apply nothing.
 - `--fresh`: ignore the saved model conversation.
+- `--effort low|high|max`: the model's thinking effort, sent as `reasoning_effort` (default `low`; also `PROSE_EFFORT`). Thinking tokens are billed as output, which is most of a build's cost. Only tested against DeepSeek.
 - `--param key=value` (repeatable): build parameters handed to the agent as `/prose/params.json` (target, environment, ...). They are remembered in `lock.json`, a changed value triggers a rebuild even if the specs did not change, and `--param key=` removes one.
 - `"instruction"`: free text for this one build. Not remembered; forces a build; recorded in `report.json`.
 
@@ -68,6 +69,7 @@ Add `.prose/history.json` to your `.gitignore`: it is large and not mergeable.
 | `DEEPSEEK_API_KEY` (or `PROSE_API_KEY`) | required |
 | `PROSE_MODEL` | `deepseek-flash` (1M context) |
 | `PROSE_BASE_URL` | `https://api.deepseek.com` (any OpenAI-compatible API) |
+| `PROSE_EFFORT` | `low` |
 | `PROSE_IMAGE` | `ubuntu:24.04` (sandbox image) |
 | `PROSE_HISTORY_LIMIT` / `_MAX` / `_TARGET` | 500000 / 800000 / 100000 |
 
