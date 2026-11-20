@@ -5,7 +5,7 @@ import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
 import { History, Msg, OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 10;
+export const PROMPT_VERSION = 11;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -25,6 +25,7 @@ Rules:
 - out/ is generated output and must never be edited by hand. Do not preserve manual edits: for every file listed in hand-edited.txt, regenerate it from the specs (restore deleted files, remove added files that the specs do not call for) and raise a warning naming those files.
 - Include whatever the specs imply (tests, build files, a README for the output) in /work.
 - Build and run the tests you wrote and fix failures before finishing.
+- Every tool result is re-sent with every later request, so read economically: look at file sizes first (wc -l), do not cat large files whole, prefer grep -n and sed -n 'START,ENDp' for the parts you need, read each part once, and edit with targeted replacements instead of re-printing or rewriting whole files. Command output over ~20000 characters is cut in the middle.
 - Use raise (as often as you like) to report things the author should know, with a severity: "info" (a notable decision), "warning" (an ambiguity you resolved by assuming something, a spec smell, a risk, a test you could not make pass), "error" (something is wrong but you could still finish). Raised issues are recorded in the build report; raising does not stop the build. Reference the spec file and line in the location field when you can.
 - If the specs are contradictory or too ambiguous to implement without guessing something important, call fail with a short explanation of what the author must fix. Nothing is applied then.
 - Your conversation from earlier builds may precede this one. Treat it as background only: the container is brand new each build (toolchains and packages you installed before are gone) and earlier tool outputs may be stale, so re-read files before relying on them. /work and the specs are the only truth.

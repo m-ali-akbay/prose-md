@@ -3,6 +3,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+const OUTPUT_LIMIT = 20_000; // chars of command output returned to the model
+
 const run = (args: string[], timeout = 60_000) =>
   new Promise<{ code: number | string; stdout: string; stderr: string }>((resolve) => {
     execFile("docker", args, { timeout, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) =>
@@ -58,7 +60,12 @@ export class Sandbox {
   async exec(command: string): Promise<string> {
     const r = await run(["exec", this.name, "bash", "-lc", command], 15 * 60_000);
     let out = `exit code: ${r.code}\n${r.stdout}${r.stderr ? "\n[stderr]\n" + r.stderr : ""}`;
-    if (out.length > 12000) out = out.slice(0, 3000) + "\n...[truncated]...\n" + out.slice(-9000);
+    if (out.length > OUTPUT_LIMIT) {
+      const head = Math.floor(OUTPUT_LIMIT / 4);
+      const tail = OUTPUT_LIMIT - head;
+      const cut = out.length - OUTPUT_LIMIT;
+      out = `${out.slice(0, head)}\n\n[... ${cut} characters cut from the middle of this output. Do not re-run the same command: narrow it, e.g. sed -n 'START,ENDp' FILE, grep -n PATTERN FILE, | head, | tail ...]\n\n${out.slice(-tail)}`;
+    }
     return out;
   }
 
