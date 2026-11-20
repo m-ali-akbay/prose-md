@@ -16,7 +16,9 @@ async function loadDotEnv(root: string) {
 
 const HELP = `prose - compile markdown into code
 
-  prose build [--dry]   compile md changes into out/
+  prose build [--dry] [--verify]
+                        compile md changes into out/; --verify lets the agent run
+                        shell commands (tests) in a scratch dir
   prose status          show md changes since the last build
   prose check           exit 1 if md files changed since the last build (no LLM call)
 
@@ -51,6 +53,7 @@ async function main() {
       model: process.env.PROSE_MODEL ?? "deepseek-chat",
       baseURL: process.env.PROSE_BASE_URL ?? "https://api.deepseek.com",
       dry: flags.includes("--dry"),
+      verify: flags.includes("--verify"),
       log: (s) => console.log(s),
     });
     switch (r.status) {

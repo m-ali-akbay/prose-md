@@ -1,0 +1,436 @@
+#!/usr/bin/env python3
+"""libctl - command line client for the library lending service.
+
+Talks to the HTTP JSON service over HTTP, using only the Python standard
+library. The base URL comes from ``--url`` or the ``LIBRARY_URL`` environment
+variable (default ``http://localhost:8080``).
+
+Examples
+--------
+    libctl add-book --title Dune --author "Frank Herbert" --isbn 9780441013593 --copies 3
+    libctl search dune
+    libctl register-member --name "Ada Lovelace" --email ada@example.com
+    libctl borrow --member <member-id> --book <book-id>
+    libctl return --loan <loan-id>
+    libctl overdue --now 2024-04-01T00:00:00Z
+    libctl history --member <member-id>
+
+Successful output is a plain aligned table. Errors reported by the service are
+printed as a single readable line on stderr and give exit code 1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any, Iterable, Sequence
+
+DEFAULT_URL = "http://localhost:8080"
+TIMEOUT_SECONDS = 15
+
+
+class ApiError(Exception):
+    """A failure reported by the service, or a transport failure."""
+
+
+# --------------------------------------------------------------------- HTTP
+
+
+def _error_message(error: urllib.error.HTTPError) -> str:
+    """Turn an HTTP error response into one readable line."""
+    try:
+        raw = error.read().decode("utf-8", "replace").strip()
+    except Exception:  # pragma: no cover - defensive
+        raw = ""
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            message = parsed.get("error") or parsed.get("message")
+            if isinstance(message, str) and message.strip():
+                text = " ".join(message.split())
+                code = parsed.get("code")
+                if isinstance(code, str) and code:
+                    return f"{text} [{code}]"
+                return text
+        collapsed = " ".join(raw.split())
+        if collapsed:
+            return collapsed
+    return f"the service answered with HTTP {error.code}"
+
+
+def request(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: Any = None,
+    now: str | None = None,
+) -> Any:
+    """Perform one API call and return the decoded JSON body (or None)."""
+    url = base_url.rstrip("/") + path
+    headers = {"Accept": "application/json"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if now:
+        headers["X-Fake-Now"] = now
+
+    http_request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(http_request, timeout=TIMEOUT_SECONDS) as response:
+            body = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as error:
+        raise ApiError(_error_message(error)) from None
+    except urllib.error.URLError as error:
+        reason = getattr(error, "reason", error)
+        raise ApiError(f"cannot reach the service at {base_url}: {reason}") from None
+    except TimeoutError:  # pragma: no cover - network timing
+        raise ApiError(f"the service at {base_url} did not answer in time") from None
+
+    if not body.strip():
+        return None
+    try:
+        return json.loads(body)
+    except ValueError:
+        raise ApiError("the service returned a malformed JSON response") from None
+
+
+# -------------------------------------------------------------------- table
+
+
+def _cell(value: Any) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    return str(value)
+
+
+def _short_time(value: Any) -> str:
+    """Render an ISO timestamp as ``YYYY-MM-DD HH:MM`` so tables stay narrow."""
+    if not isinstance(value, str) or value == "":
+        return "-"
+    if len(value) >= 16 and value[10] == "T":
+        return f"{value[0:10]} {value[11:16]}"
+    return value
+
+
+def render_table(headers: Sequence[str], rows: Iterable[Sequence[Any]], empty: str = "no results") -> str:
+    """Render a plain left-aligned table."""
+    prepared = [[_cell(value) for value in row] for row in rows]
+    if not prepared:
+        return empty
+
+    widths = [len(header) for header in headers]
+    for row in prepared:
+        for index, value in enumerate(row):
+            if index < len(widths):
+                widths[index] = max(widths[index], len(value))
+
+    def format_row(row: Sequence[str]) -> str:
+        return "  ".join(value.ljust(widths[index]) for index, value in enumerate(row)).rstrip()
+
+    lines = [format_row(list(headers)), "  ".join("-" * width for width in widths)]
+    lines.extend(format_row(row) for row in prepared)
+    return "\n".join(lines)
+
+
+def _loan_book_title(loan: dict[str, Any]) -> str:
+    book = loan.get("book")
+    if isinstance(book, dict) and book.get("title"):
+        return str(book["title"])
+    return str(loan.get("bookId", "-"))
+
+
+def _loan_member_name(loan: dict[str, Any]) -> str:
+    member = loan.get("member")
+    if isinstance(member, dict) and member.get("name"):
+        return str(member["name"])
+    return str(loan.get("memberId", "-"))
+
+
+def _book_rows(books: Iterable[dict[str, Any]]) -> list[list[Any]]:
+    return [
+        [
+            book.get("id"),
+            book.get("isbn"),
+            book.get("title"),
+            book.get("author"),
+            book.get("copiesOwned"),
+            book.get("copiesAvailable"),
+        ]
+        for book in books
+    ]
+
+
+BOOK_HEADERS = ["ID", "ISBN", "TITLE", "AUTHOR", "OWNED", "AVAILABLE"]
+MEMBER_HEADERS = ["ID", "NAME", "EMAIL", "SUSPENDED", "ACTIVE LOANS"]
+
+
+def _member_rows(members: Iterable[dict[str, Any]]) -> list[list[Any]]:
+    return [
+        [
+            member.get("id"),
+            member.get("name"),
+            member.get("email"),
+            member.get("suspended"),
+            member.get("activeLoans"),
+        ]
+        for member in members
+    ]
+
+
+# ----------------------------------------------------------------- commands
+
+
+def command_add_book(args: argparse.Namespace, base_url: str) -> int:
+    payload = {
+        "title": args.title,
+        "author": args.author,
+        "isbn": args.isbn,
+        "copies": args.copies,
+    }
+    book = request(base_url, "POST", "/books", payload, args.now)
+    print(render_table(BOOK_HEADERS, _book_rows([book])))
+    return 0
+
+
+def command_search(args: argparse.Namespace, base_url: str) -> int:
+    if args.field == "title":
+        query = {"title": args.query}
+    elif args.field == "author":
+        query = {"author": args.query}
+    else:
+        query = {"q": args.query}
+    data = request(base_url, "GET", "/books?" + urllib.parse.urlencode(query), now=args.now)
+    books = data.get("books", []) if isinstance(data, dict) else []
+    print(render_table(BOOK_HEADERS, _book_rows(books), empty=f'no books matched "{args.query}"'))
+    return 0
+
+
+def command_list_books(args: argparse.Namespace, base_url: str) -> int:
+    data = request(base_url, "GET", "/books", now=args.now)
+    books = data.get("books", []) if isinstance(data, dict) else []
+    print(render_table(BOOK_HEADERS, _book_rows(books), empty="no books in the catalogue"))
+    return 0
+
+
+def command_register_member(args: argparse.Namespace, base_url: str) -> int:
+    payload = {"name": args.name, "email": args.email}
+    member = request(base_url, "POST", "/members", payload, args.now)
+    print(render_table(MEMBER_HEADERS, _member_rows([member])))
+    return 0
+
+
+def command_list_members(args: argparse.Namespace, base_url: str) -> int:
+    data = request(base_url, "GET", "/members", now=args.now)
+    members = data.get("members", []) if isinstance(data, dict) else []
+    print(render_table(MEMBER_HEADERS, _member_rows(members), empty="no members registered"))
+    return 0
+
+
+def command_borrow(args: argparse.Namespace, base_url: str) -> int:
+    payload = {"memberId": args.member, "bookId": args.book}
+    loan = request(base_url, "POST", "/loans", payload, args.now)
+    print(
+        render_table(
+            ["LOAN", "BOOK", "MEMBER", "BORROWED", "DUE"],
+            [
+                [
+                    loan.get("id"),
+                    _loan_book_title(loan),
+                    _loan_member_name(loan),
+                    _short_time(loan.get("borrowedAt")),
+                    _short_time(loan.get("dueAt")),
+                ]
+            ],
+        )
+    )
+    return 0
+
+
+def command_renew(args: argparse.Namespace, base_url: str) -> int:
+    loan = request(base_url, "POST", f"/loans/{urllib.parse.quote(str(args.loan))}/renew", None, args.now)
+    print(
+        render_table(
+            ["LOAN", "BOOK", "MEMBER", "DUE", "RENEWALS"],
+            [
+                [
+                    loan.get("id"),
+                    _loan_book_title(loan),
+                    _loan_member_name(loan),
+                    _short_time(loan.get("dueAt")),
+                    loan.get("renewals"),
+                ]
+            ],
+        )
+    )
+    return 0
+
+
+def command_return(args: argparse.Namespace, base_url: str) -> int:
+    loan = request(base_url, "POST", f"/loans/{urllib.parse.quote(str(args.loan))}/return", None, args.now)
+    print(
+        render_table(
+            ["LOAN", "BOOK", "MEMBER", "DUE", "RETURNED", "STATUS"],
+            [
+                [
+                    loan.get("id"),
+                    _loan_book_title(loan),
+                    _loan_member_name(loan),
+                    _short_time(loan.get("dueAt")),
+                    _short_time(loan.get("returnedAt")),
+                    loan.get("status"),
+                ]
+            ],
+        )
+    )
+    return 0
+
+
+def command_overdue(args: argparse.Namespace, base_url: str) -> int:
+    data = request(base_url, "GET", "/loans/overdue", now=args.now)
+    loans = data.get("loans", []) if isinstance(data, dict) else []
+    rows = [
+        [
+            loan.get("id"),
+            _loan_book_title(loan),
+            _loan_member_name(loan),
+            _short_time(loan.get("dueAt")),
+            loan.get("daysOverdue"),
+        ]
+        for loan in loans
+    ]
+    print(render_table(["LOAN", "BOOK", "MEMBER", "DUE", "DAYS LATE"], rows, empty="no overdue loans"))
+    return 0
+
+
+def command_history(args: argparse.Namespace, base_url: str) -> int:
+    path = f"/members/{urllib.parse.quote(str(args.member))}/loans"
+    data = request(base_url, "GET", path, now=args.now)
+    loans = data.get("loans", []) if isinstance(data, dict) else []
+    rows = [
+        [
+            loan.get("id"),
+            _loan_book_title(loan),
+            _short_time(loan.get("borrowedAt")),
+            _short_time(loan.get("dueAt")),
+            _short_time(loan.get("returnedAt")),
+            loan.get("status"),
+        ]
+        for loan in loans
+    ]
+    print(
+        render_table(
+            ["LOAN", "BOOK", "BORROWED", "DUE", "RETURNED", "STATUS"],
+            rows,
+            empty="no loans for this member",
+        )
+    )
+    return 0
+
+
+# ---------------------------------------------------------------- argparse
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--url",
+        default=None,
+        help="base URL of the service (default: $LIBRARY_URL or %s)" % DEFAULT_URL,
+    )
+    common.add_argument(
+        "--now",
+        default=None,
+        metavar="ISO8601",
+        help="pretend it is this moment (sent as the X-Fake-Now header)",
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="libctl",
+        description="Command line client for the library lending service.",
+        epilog="The service URL can also be set with the LIBRARY_URL environment variable.",
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    add_book = subparsers.add_parser("add-book", parents=[common], help="add a book (or more copies of it)")
+    add_book.add_argument("--title", required=True, help="book title")
+    add_book.add_argument("--author", required=True, help="book author")
+    add_book.add_argument("--isbn", required=True, help="ISBN (unique per book)")
+    add_book.add_argument("--copies", type=int, default=1, help="number of copies owned (default: 1)")
+    add_book.set_defaults(handler=command_add_book)
+
+    search = subparsers.add_parser("search", parents=[common], help="search books by title or author")
+    search.add_argument("query", help="case-insensitive partial match")
+    search.add_argument(
+        "--field",
+        choices=["any", "title", "author"],
+        default="any",
+        help="restrict the search to one field (default: any)",
+    )
+    search.set_defaults(handler=command_search)
+
+    list_books = subparsers.add_parser("list-books", parents=[common], help="list the whole catalogue")
+    list_books.set_defaults(handler=command_list_books)
+
+    register = subparsers.add_parser("register-member", parents=[common], help="register a member")
+    register.add_argument("--name", required=True, help="member name")
+    register.add_argument("--email", required=True, help="member email (unique, case-insensitive)")
+    register.set_defaults(handler=command_register_member)
+
+    list_members = subparsers.add_parser("list-members", parents=[common], help="list registered members")
+    list_members.set_defaults(handler=command_list_members)
+
+    borrow = subparsers.add_parser("borrow", parents=[common], help="borrow a copy of a book")
+    borrow.add_argument("--member", required=True, help="member id")
+    borrow.add_argument("--book", required=True, help="book id")
+    borrow.set_defaults(handler=command_borrow)
+
+    renew = subparsers.add_parser("renew", parents=[common], help="renew a loan once for 7 more days")
+    renew.add_argument("--loan", required=True, help="loan id")
+    renew.set_defaults(handler=command_renew)
+
+    ret = subparsers.add_parser("return", parents=[common], help="return a borrowed book")
+    ret.add_argument("--loan", required=True, help="loan id")
+    ret.set_defaults(handler=command_return)
+
+    overdue = subparsers.add_parser("overdue", parents=[common], help="list overdue loans")
+    overdue.set_defaults(handler=command_overdue)
+
+    history = subparsers.add_parser(
+        "history",
+        parents=[common],
+        help="list all loans (active and returned) of a member, newest first",
+    )
+    history.add_argument("--member", required=True, help="member id")
+    history.set_defaults(handler=command_history)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "handler", None):
+        parser.print_help()
+        return 2
+
+    base_url = args.url or os.environ.get("LIBRARY_URL") or DEFAULT_URL
+    try:
+        return int(args.handler(args, base_url))
+    except ApiError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

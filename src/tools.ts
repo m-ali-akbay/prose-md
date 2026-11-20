@@ -8,11 +8,18 @@ export interface BuildState {
   mds: Record<string, string>;
   changes: MdChanges;
   notes: string;
+  exec?: (command: string) => Promise<string>;
   finished?: string;
   questions?: string[];
 }
 
-export const toolDefs = [
+const runCommandDef: [string, string, Record<string, string>] = [
+  "run_command",
+  "Run a shell command (build, tests, ...) in a scratch copy of the current staged outputs (root = out/). Use it to verify your work; the scratch dir persists between calls within this build, so installed dependencies are kept. Returns exit code and output.",
+  { command: "string" },
+];
+
+const baseDefs: [string, string, Record<string, string>][] = [
   ["list_md", "List all markdown spec files with sizes.", {}],
   ["read_md", "Read a markdown spec file.", { path: "string" }],
   ["get_md_diff", "Get the unified diff of all md files since the last successful build.", {}],
@@ -23,7 +30,9 @@ export const toolDefs = [
   ["write_notes", "Replace the build notes. Notes persist to the next build; record structure, decisions, which spec produced which files.", { content: "string" }],
   ["ask_user", "Abort the build and ask the author questions when the specs are ambiguous or contradictory. Nothing is written.", { questions: "array" }],
   ["finish", "Finish the build and commit all staged changes.", { summary: "string" }],
-].map(([name, description, props]) => ({
+];
+
+export const makeToolDefs = (verify: boolean) => (verify ? [...baseDefs.slice(0, -1), runCommandDef, baseDefs[baseDefs.length - 1]] : baseDefs).map(([name, description, props]) => ({
   type: "function" as const,
   function: {
     name: name as string,
@@ -50,7 +59,7 @@ function safe(p: unknown): string {
   return norm;
 }
 
-export function runTool(s: BuildState, name: string, a: any): string {
+export async function runTool(s: BuildState, name: string, a: any): Promise<string> {
   switch (name) {
     case "list_md":
       return Object.entries(s.mds).map(([f, c]) => `${f} (${c.length} chars)`).join("\n") || "(none)";
@@ -83,6 +92,9 @@ export function runTool(s: BuildState, name: string, a: any): string {
       delete s.outputs[p];
       return `deleted ${p}`;
     }
+    case "run_command":
+      if (!s.exec) throw new Error("run_command is not enabled");
+      return await s.exec(String(a.command ?? ""));
     case "write_notes":
       s.notes = String(a.content ?? "");
       return "notes updated";

@@ -5,7 +5,9 @@ import { diffMds, hasChanges } from "./diff.js";
 import {
   OUT_DIR, hash, loadSnapshot, readMds, readOutputs, saveSnapshot,
 } from "./snapshot.js";
-import { BuildState, runTool, toolDefs } from "./tools.js";
+import { exec as cpExec } from "node:child_process";
+import os from "node:os";
+import { BuildState, makeToolDefs, runTool } from "./tools.js";
 
 export const PROMPT_VERSION = 1;
 
@@ -21,6 +23,7 @@ Rules:
 - Outputs flagged "[changed since last build]" were edited by hand; preserve their intent unless the specs contradict them.
 - Include whatever the specs imply (tests, build files, README for the output) inside out/.
 - Before finish, call write_notes with concise notes for your future self: project structure, key design decisions, which spec maps to which output files, anything pending. Notes are rewritten in full each time.
+- If run_command is available, install dependencies, build and run the tests you wrote, and fix failures before finishing. Do not finish with failing tests unless the specs make that unavoidable (then say so in the summary).
 - When done, call finish. Nothing is committed until you do.`;
 
 export interface BuildOptions {
@@ -30,6 +33,8 @@ export interface BuildOptions {
   baseURL: string;
   maxTurns?: number;
   dry?: boolean;
+  /** allow the agent to run shell commands (tests etc.) in a scratch dir */
+  verify?: boolean;
   log?: (s: string) => void;
 }
 
@@ -56,6 +61,29 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     notes: snap.notes,
   };
 
+  let scratch: string | undefined;
+  const synced = new Set<string>();
+  if (o.verify) {
+    scratch = await fs.mkdtemp(path.join(os.tmpdir(), "prose-"));
+    state.exec = async (command) => {
+      for (const f of synced) if (!(f in state.outputs)) await fs.rm(path.join(scratch!, f), { force: true });
+      synced.clear();
+      for (const [f, c] of Object.entries(state.outputs)) {
+        await fs.mkdir(path.dirname(path.join(scratch!, f)), { recursive: true });
+        await fs.writeFile(path.join(scratch!, f), c);
+        synced.add(f);
+      }
+      return new Promise<string>((resolve) => {
+        cpExec(command, { cwd: scratch, timeout: 180_000, maxBuffer: 10 * 1024 * 1024, env: { ...process.env, CI: "1" } }, (err, stdout, stderr) => {
+          const code = err ? ((err as any).killed ? "timeout" : ((err as any).code ?? 1)) : 0;
+          let out = `exit code: ${code}\n${stdout}${stderr ? "\n[stderr]\n" + stderr : ""}`;
+          if (out.length > 12000) out = out.slice(0, 3000) + "\n...[truncated]...\n" + out.slice(-9000);
+          resolve(out);
+        });
+      });
+    };
+  }
+
   const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
   const first = [
     `Changes since last build: ${changes.added.length} added, ${changes.modified.length} modified, ${changes.deleted.length} deleted md files.`,
@@ -81,13 +109,16 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     { role: "user", content: first },
   ];
 
-  const maxTurns = o.maxTurns ?? 60;
+  const maxTurns = o.maxTurns ?? 150;
   let nudged = false;
   for (let turn = 0; turn < maxTurns && !state.finished && !state.questions; turn++) {
+    if (turn === maxTurns - 15) {
+      messages.push({ role: "user", content: "You are running out of turns. Stop refining, write_notes and call finish within a few turns." });
+    }
     const res = await client.chat.completions.create({
       model: o.model,
       messages,
-      tools: toolDefs,
+      tools: makeToolDefs(!!o.verify),
     });
     const msg = res.choices[0].message;
     messages.push(msg as OpenAI.Chat.ChatCompletionMessageParam);
@@ -95,7 +126,10 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
 
     const calls = (msg.tool_calls ?? []).filter((c) => c.type === "function");
     if (calls.length === 0) {
-      if (nudged) return { status: "failed", reason: "model stopped without calling finish or ask_user" };
+      if (nudged) {
+        if (scratch) await fs.rm(scratch, { recursive: true, force: true });
+        return { status: "failed", reason: "model stopped without calling finish or ask_user" };
+      }
       nudged = true;
       messages.push({ role: "user", content: "Continue using tools. Call finish when done, or ask_user if blocked." });
       continue;
@@ -104,8 +138,8 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       let out: string;
       try {
         const args = JSON.parse(c.function.arguments || "{}");
-        out = runTool(state, c.function.name, args);
-        log(`  ${c.function.name}${args.path ? " " + args.path : ""}`);
+        out = await runTool(state, c.function.name, args);
+        log(`  ${c.function.name}${args.path ? " " + args.path : ""}${args.command ? ": " + args.command : ""}`);
       } catch (e) {
         out = `error: ${(e as Error).message}`;
         log(`  ${c.function.name} -> ${out}`);
@@ -114,6 +148,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     }
   }
 
+  if (scratch) await fs.rm(scratch, { recursive: true, force: true });
   if (state.questions) return { status: "questions", questions: state.questions };
   if (state.finished === undefined) return { status: "failed", reason: `no finish after ${maxTurns} turns; nothing written` };
 
