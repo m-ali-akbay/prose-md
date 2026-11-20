@@ -5,3 +5,5 @@ A book has a title, an author, an ISBN and a number of copies owned. ISBNs are u
 Clients can list books, search by title or author (case-insensitive, partial match), and see how many copies are currently available (owned minus on loan).
 
 A book cannot be removed while any copy is on loan.
+
+Books can have a list of tags. Search can additionally filter by one tag. Tags are case-insensitive and shown when listing books.

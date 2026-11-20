@@ -7,13 +7,16 @@ variable (default ``http://localhost:8080``).
 
 Examples
 --------
-    libctl add-book --title Dune --author "Frank Herbert" --isbn 9780441013593 --copies 3
+    libctl add-book --title Dune --author "Frank Herbert" --isbn 9780441013593 --copies 3 --tag scifi
     libctl search dune
+    libctl search dune --tag scifi
     libctl register-member --name "Ada Lovelace" --email ada@example.com
     libctl borrow --member <member-id> --book <book-id>
     libctl return --loan <loan-id>
     libctl overdue --now 2024-04-01T00:00:00Z
     libctl history --member <member-id>
+    libctl fines --member <member-id>
+    libctl pay --member <member-id> --amount 1.25
 
 Successful output is a plain aligned table. Errors reported by the service are
 printed as a single readable line on stderr and give exit code 1.
@@ -114,6 +117,13 @@ def _cell(value: Any) -> str:
     return str(value)
 
 
+def _money(value: Any) -> str:
+    """Render an amount of money with exactly two decimals."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "-"
+    return f"{float(value):.2f}"
+
+
 def _short_time(value: Any) -> str:
     """Render an ISO timestamp as ``YYYY-MM-DD HH:MM`` so tables stay narrow."""
     if not isinstance(value, str) or value == "":
@@ -157,6 +167,13 @@ def _loan_member_name(loan: dict[str, Any]) -> str:
     return str(loan.get("memberId", "-"))
 
 
+def _tags(value: Any) -> str:
+    """Render a list of tags as one comma separated cell."""
+    if not isinstance(value, list):
+        return "-"
+    return ",".join(str(tag) for tag in value) or "-"
+
+
 def _book_rows(books: Iterable[dict[str, Any]]) -> list[list[Any]]:
     return [
         [
@@ -166,12 +183,13 @@ def _book_rows(books: Iterable[dict[str, Any]]) -> list[list[Any]]:
             book.get("author"),
             book.get("copiesOwned"),
             book.get("copiesAvailable"),
+            _tags(book.get("tags")),
         ]
         for book in books
     ]
 
 
-BOOK_HEADERS = ["ID", "ISBN", "TITLE", "AUTHOR", "OWNED", "AVAILABLE"]
+BOOK_HEADERS = ["ID", "ISBN", "TITLE", "AUTHOR", "OWNED", "AVAILABLE", "TAGS"]
 MEMBER_HEADERS = ["ID", "NAME", "EMAIL", "SUSPENDED", "ACTIVE LOANS"]
 
 
@@ -192,27 +210,44 @@ def _member_rows(members: Iterable[dict[str, Any]]) -> list[list[Any]]:
 
 
 def command_add_book(args: argparse.Namespace, base_url: str) -> int:
-    payload = {
+    payload: dict[str, Any] = {
         "title": args.title,
         "author": args.author,
         "isbn": args.isbn,
         "copies": args.copies,
     }
+    if args.tag:
+        payload["tags"] = list(args.tag)
     book = request(base_url, "POST", "/books", payload, args.now)
     print(render_table(BOOK_HEADERS, _book_rows([book])))
     return 0
 
 
+def _describe_search(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    if args.query:
+        parts.append(f'"{args.query}"')
+    if args.tag:
+        parts.append(f'tag "{args.tag}"')
+    return " and ".join(parts) or "the search"
+
+
 def command_search(args: argparse.Namespace, base_url: str) -> int:
-    if args.field == "title":
-        query = {"title": args.query}
-    elif args.field == "author":
-        query = {"author": args.query}
-    else:
-        query = {"q": args.query}
+    if not args.query and not args.tag:
+        raise ApiError("give a search query, a --tag, or both")
+    query: dict[str, str] = {}
+    if args.query:
+        if args.field == "title":
+            query["title"] = args.query
+        elif args.field == "author":
+            query["author"] = args.query
+        else:
+            query["q"] = args.query
+    if args.tag:
+        query["tag"] = args.tag
     data = request(base_url, "GET", "/books?" + urllib.parse.urlencode(query), now=args.now)
     books = data.get("books", []) if isinstance(data, dict) else []
-    print(render_table(BOOK_HEADERS, _book_rows(books), empty=f'no books matched "{args.query}"'))
+    print(render_table(BOOK_HEADERS, _book_rows(books), empty=f"no books matched {_describe_search(args)}"))
     return 0
 
 
@@ -278,9 +313,11 @@ def command_renew(args: argparse.Namespace, base_url: str) -> int:
 
 def command_return(args: argparse.Namespace, base_url: str) -> int:
     loan = request(base_url, "POST", f"/loans/{urllib.parse.quote(str(args.loan))}/return", None, args.now)
+    fine = loan.get("fine")
+    fine_amount = _money(fine.get("amount")) if isinstance(fine, dict) else "-"
     print(
         render_table(
-            ["LOAN", "BOOK", "MEMBER", "DUE", "RETURNED", "STATUS"],
+            ["LOAN", "BOOK", "MEMBER", "DUE", "RETURNED", "STATUS", "FINE"],
             [
                 [
                     loan.get("id"),
@@ -289,6 +326,7 @@ def command_return(args: argparse.Namespace, base_url: str) -> int:
                     _short_time(loan.get("dueAt")),
                     _short_time(loan.get("returnedAt")),
                     loan.get("status"),
+                    fine_amount,
                 ]
             ],
         )
@@ -310,6 +348,62 @@ def command_overdue(args: argparse.Namespace, base_url: str) -> int:
         for loan in loans
     ]
     print(render_table(["LOAN", "BOOK", "MEMBER", "DUE", "DAYS LATE"], rows, empty="no overdue loans"))
+    return 0
+
+
+FINE_HEADERS = ["FINE", "LOAN", "AMOUNT", "PAID", "OUTSTANDING", "CHARGED"]
+
+
+def command_fines(args: argparse.Namespace, base_url: str) -> int:
+    path = f"/members/{urllib.parse.quote(str(args.member))}/fines"
+    data = request(base_url, "GET", path, now=args.now)
+    account = data if isinstance(data, dict) else {}
+    fines = account.get("fines", []) if isinstance(account.get("fines"), list) else []
+    rows = [
+        [
+            fine.get("id"),
+            fine.get("loanId"),
+            _money(fine.get("amount")),
+            _money(fine.get("paid")),
+            _money(fine.get("outstanding")),
+            _short_time(fine.get("createdAt")),
+        ]
+        for fine in fines
+    ]
+    print(render_table(FINE_HEADERS, rows, empty="no fines for this member"))
+    print(
+        "outstanding: %s (limit %s for borrowing)"
+        % (_money(account.get("totalOutstanding", 0)), _money(account.get("limit", 0)))
+    )
+    accruing = account.get("accruing", 0)
+    if isinstance(accruing, (int, float)) and not isinstance(accruing, bool) and accruing > 0:
+        print("still accruing on overdue loans: %s" % _money(accruing))
+    return 0
+
+
+def command_pay(args: argparse.Namespace, base_url: str) -> int:
+    path = f"/members/{urllib.parse.quote(str(args.member))}/fines/pay"
+    payload: dict[str, Any] = {}
+    if args.amount is not None:
+        payload["amount"] = args.amount
+    if args.fine is not None:
+        payload["fineId"] = args.fine
+    data = request(base_url, "POST", path, payload or None, args.now)
+    account = data if isinstance(data, dict) else {}
+    fines = account.get("fines", []) if isinstance(account.get("fines"), list) else []
+    rows = [
+        [
+            fine.get("id"),
+            fine.get("loanId"),
+            _money(fine.get("amount")),
+            _money(fine.get("paid")),
+            _money(fine.get("outstanding")),
+        ]
+        for fine in fines
+    ]
+    print(render_table(["FINE", "LOAN", "AMOUNT", "PAID", "OUTSTANDING"], rows))
+    print("paid: %s" % _money(account.get("paidNow", 0)))
+    print("outstanding: %s" % _money(account.get("totalOutstanding", 0)))
     return 0
 
 
@@ -367,16 +461,28 @@ def build_parser() -> argparse.ArgumentParser:
     add_book.add_argument("--author", required=True, help="book author")
     add_book.add_argument("--isbn", required=True, help="ISBN (unique per book)")
     add_book.add_argument("--copies", type=int, default=1, help="number of copies owned (default: 1)")
+    add_book.add_argument(
+        "--tag",
+        action="append",
+        metavar="TAG",
+        help="tag of the book (case-insensitive, repeatable)",
+    )
     add_book.set_defaults(handler=command_add_book)
 
     search = subparsers.add_parser("search", parents=[common], help="search books by title or author")
-    search.add_argument("query", help="case-insensitive partial match")
+    search.add_argument(
+        "query",
+        nargs="?",
+        default=None,
+        help="case-insensitive partial match (may be omitted when --tag is given)",
+    )
     search.add_argument(
         "--field",
         choices=["any", "title", "author"],
         default="any",
         help="restrict the search to one field (default: any)",
     )
+    search.add_argument("--tag", default=None, metavar="TAG", help="only books carrying this tag")
     search.set_defaults(handler=command_search)
 
     list_books = subparsers.add_parser("list-books", parents=[common], help="list the whole catalogue")
@@ -413,6 +519,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     history.add_argument("--member", required=True, help="member id")
     history.set_defaults(handler=command_history)
+
+    fines = subparsers.add_parser("fines", parents=[common], help="show the fines of a member")
+    fines.add_argument("--member", required=True, help="member id")
+    fines.set_defaults(handler=command_fines)
+
+    pay = subparsers.add_parser(
+        "pay",
+        parents=[common],
+        help="pay fines of a member (fully, partially, or one fine with --fine)",
+    )
+    pay.add_argument("--member", required=True, help="member id")
+    pay.add_argument("--amount", type=float, default=None, help="amount to pay (default: everything outstanding)")
+    pay.add_argument("--fine", default=None, help="pay this one fine instead of the oldest first")
+    pay.set_defaults(handler=command_pay)
 
     return parser
 

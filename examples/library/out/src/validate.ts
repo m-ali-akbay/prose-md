@@ -40,6 +40,51 @@ export function readOptionalPositiveInt(source: JsonObject, field: string): numb
   return raw;
 }
 
+/**
+ * Read an optional list of short, non-empty strings (used for book tags).
+ * Blank entries are dropped, duplicates are removed case-insensitively, and
+ * the result preserves the first spelling seen (lower-cased).
+ */
+export function readOptionalStringList(
+  source: JsonObject,
+  field: string,
+  options: { maxItems?: number; maxLength?: number; toLowerCase?: boolean } = {},
+): string[] | undefined {
+  const raw = source[field];
+  if (raw === undefined || raw === null) {
+    return undefined;
+  }
+  if (!Array.isArray(raw)) {
+    throw badRequest(`"${field}" must be an array of strings`);
+  }
+  const maxItems = options.maxItems ?? 20;
+  const maxLength = options.maxLength ?? 40;
+  if (raw.length > maxItems) {
+    throw badRequest(`"${field}" must contain at most ${maxItems} entries`);
+  }
+  const seen = new Set<string>();
+  const values: string[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string') {
+      throw badRequest(`"${field}" must be an array of strings`);
+    }
+    const trimmed = entry.trim();
+    if (trimmed === '') {
+      continue;
+    }
+    if (trimmed.length > maxLength) {
+      throw badRequest(`every "${field}" entry must be at most ${maxLength} characters`);
+    }
+    const value = options.toLowerCase === false ? trimmed : trimmed.toLowerCase();
+    if (seen.has(value)) {
+      continue;
+    }
+    seen.add(value);
+    values.push(value);
+  }
+  return values;
+}
+
 export function readQueryString(value: string | null, field: string): string | undefined {
   if (value === null) {
     return undefined;

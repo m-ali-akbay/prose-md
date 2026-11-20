@@ -7,3 +7,6 @@ Returning a book that is more than 14 days late suspends the member automaticall
 The service must accept a configurable "now" through an `X-Fake-Now` request header so that tests and demos can simulate the passage of time.
 
 Members with a suspension can still renew nothing: renewing is also refused while a member is suspended. Add a "loan history" view that lists all loans (active and returned) of a member, newest first.
+
+
+Late returns accrue a fine of 0.25 per day late. A member whose unpaid fines exceed 5.00 cannot borrow. Fines can be viewed per member and paid (fully or partially).

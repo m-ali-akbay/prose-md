@@ -185,6 +185,85 @@ describe('libctl command line client', () => {
     assert.match(empty.stderr, /^error: /);
   });
 
+  it('adds books with tags and filters searches by tag', async (t) => {
+    if (!pythonAvailable()) {
+      t.skip(`${PYTHON} is not available`);
+      return;
+    }
+
+    const added = await runCli(
+      [
+        'add-book',
+        '--title', 'A Wizard of Earthsea',
+        '--author', 'Ursula K. Le Guin',
+        '--isbn', '9780547773742',
+        '--tag', 'Fantasy',
+        '--tag', 'young-adult',
+      ],
+      env,
+    );
+    assert.equal(added.code, 0, added.stderr);
+    assert.match(added.stdout, /TAGS/);
+    assert.match(added.stdout, /fantasy,young-adult/);
+
+    const byTag = await runCli(['search', '--tag', 'FANTASY'], env);
+    assert.equal(byTag.code, 0, byTag.stderr);
+    assert.match(byTag.stdout, /A Wizard of Earthsea/);
+    assert.doesNotMatch(byTag.stdout, /Dune\b/);
+
+    const combined = await runCli(['search', 'earthsea', '--tag', 'fantasy'], env);
+    assert.equal(combined.code, 0, combined.stderr);
+    assert.match(combined.stdout, /A Wizard of Earthsea/);
+
+    const mismatched = await runCli(['search', 'earthsea', '--tag', 'western'], env);
+    assert.equal(mismatched.code, 0, mismatched.stderr);
+    assert.match(mismatched.stdout, /no books matched/);
+
+    const noCriteria = await runCli(['search'], env);
+    assert.notEqual(noCriteria.code, 0);
+    assert.match(noCriteria.stderr, /^error: /);
+  });
+
+  it('shows the fines of a member and pays them', async (t) => {
+    if (!pythonAvailable()) {
+      t.skip(`${PYTHON} is not available`);
+      return;
+    }
+
+    const book = await api.request('POST', '/books', {
+      title: 'The Dispossessed',
+      author: 'Ursula K. Le Guin',
+      isbn: '9780060512750',
+    });
+    const member = await api.request('POST', '/members', { name: 'Shevek', email: 'shevek@example.com' });
+
+    const borrowed = await api.request('POST', '/loans', { memberId: member.body.id, bookId: book.body.id }, {
+      'X-Fake-Now': T0,
+    });
+    await api.request('POST', `/loans/${borrowed.body.id}/return`, undefined, { 'X-Fake-Now': isoAfter(T0, 18) });
+
+    const fines = await runCli(['fines', '--member', member.body.id], env);
+    assert.equal(fines.code, 0, fines.stderr);
+    assert.match(fines.stdout, /OUTSTANDING/);
+    assert.match(fines.stdout, /1\.00/);
+    assert.match(fines.stdout, /outstanding: 1\.00/);
+
+    const partial = await runCli(['pay', '--member', member.body.id, '--amount', '0.25'], env);
+    assert.equal(partial.code, 0, partial.stderr);
+    assert.match(partial.stdout, /paid: 0\.25/);
+    assert.match(partial.stdout, /outstanding: 0\.75/);
+
+    const rest = await runCli(['pay', '--member', member.body.id], env);
+    assert.equal(rest.code, 0, rest.stderr);
+    assert.match(rest.stdout, /outstanding: 0\.00/);
+
+    const failed = await runCli(['pay', '--member', member.body.id], env);
+    assert.notEqual(failed.code, 0);
+    assert.equal(failed.stderr.trim().split('\n').length, 1);
+    assert.match(failed.stderr, /^error: /);
+    assert.match(failed.stderr, /no outstanding fines/i);
+  });
+
   it('prints service errors as one line and exits non-zero', async (t) => {
     if (!pythonAvailable()) {
       t.skip(`${PYTHON} is not available`);

@@ -155,3 +155,139 @@ describe('books', () => {
     assert.equal(badJson.body.code, 'BAD_JSON');
   });
 });
+
+describe('book tags', () => {
+  let api: TestServer;
+  let counter = 0;
+
+  before(async () => {
+    api = await startServer();
+  });
+
+  after(async () => {
+    await api.close();
+  });
+
+  function nextIsbn(): string {
+    counter += 1;
+    return `tag-isbn-${counter}`;
+  }
+
+  async function add(tags: unknown, extra: Record<string, unknown> = {}) {
+    return api.request('POST', '/books', {
+      title: `Tagged ${counter}`,
+      author: 'An Author',
+      isbn: nextIsbn(),
+      tags,
+      ...extra,
+    });
+  }
+
+  it('stores tags case-insensitively and shows them when listing', async () => {
+    const created = await add(['SciFi', 'space ', 'sci-fi']);
+    assert.equal(created.status, 201);
+    assert.deepEqual(created.body.tags, ['scifi', 'space', 'sci-fi']);
+
+    const listed = await api.request('GET', '/books');
+    const book = listed.body.books.find((candidate: { id: string }) => candidate.id === created.body.id);
+    assert.deepEqual(book.tags, ['scifi', 'space', 'sci-fi']);
+
+    const single = await api.request('GET', `/books/${created.body.id}`);
+    assert.deepEqual(single.body.tags, ['scifi', 'space', 'sci-fi']);
+  });
+
+  it('defaults to no tags', async () => {
+    const created = await add(undefined);
+    assert.equal(created.status, 201);
+    assert.deepEqual(created.body.tags, []);
+  });
+
+  it('filters the catalogue by one tag, case-insensitively', async () => {
+    const tagged = await add(['Poetry']);
+    const other = await add(['Drama']);
+
+    const found = await api.request('GET', '/books?tag=POETRY');
+    assert.equal(found.status, 200);
+    const ids = found.body.books.map((book: { id: string }) => book.id);
+    assert.ok(ids.includes(tagged.body.id));
+    assert.ok(!ids.includes(other.body.id));
+
+    const trimmed = await api.request('GET', '/books?tag=%20poetry%20');
+    assert.deepEqual(
+      trimmed.body.books.map((book: { id: string }) => book.id),
+      [tagged.body.id],
+    );
+
+    const none = await api.request('GET', '/books?tag=no-such-tag');
+    assert.deepEqual(none.body.books, []);
+  });
+
+  it('combines a tag filter with the text search', async () => {
+    const unique = `Combo${counter}${nextIsbn()}`;
+    const book = await api.request('POST', '/books', {
+      title: unique,
+      author: 'Combo Author',
+      isbn: nextIsbn(),
+      tags: ['History'],
+    });
+    assert.equal(book.status, 201);
+
+    const combined = await api.request('GET', `/books?q=${unique.toLowerCase()}&tag=history`);
+    assert.deepEqual(
+      combined.body.books.map((candidate: { id: string }) => candidate.id),
+      [book.body.id],
+    );
+
+    const mismatched = await api.request('GET', `/books?q=${unique}&tag=poetry`);
+    assert.deepEqual(mismatched.body.books, []);
+  });
+
+  it('merges tags when copies are added under an existing ISBN', async () => {
+    const isbnValue = nextIsbn();
+    const first = await api.request('POST', '/books', {
+      title: 'Merged',
+      author: 'An Author',
+      isbn: isbnValue,
+      tags: ['first'],
+    });
+    assert.equal(first.status, 201);
+
+    const second = await api.request('POST', '/books', {
+      title: 'Merged',
+      author: 'An Author',
+      isbn: isbnValue,
+      copies: 2,
+      tags: ['Second', 'first'],
+    });
+    assert.equal(second.status, 200);
+    assert.equal(second.body.id, first.body.id);
+    assert.equal(second.body.copiesOwned, 3);
+    assert.deepEqual(second.body.tags, ['first', 'second']);
+  });
+
+  it('rejects malformed tag lists', async () => {
+    const notAList = await add('scifi');
+    assert.equal(notAList.status, 400);
+
+    const notStrings = await add(['scifi', 42]);
+    assert.equal(notStrings.status, 400);
+
+    const tooLong = await add(['x'.repeat(41)]);
+    assert.equal(tooLong.status, 400);
+
+    const tooMany = await add(Array.from({ length: 21 }, (_unused, index) => `tag-${index}`));
+    assert.equal(tooMany.status, 400);
+  });
+
+  it('includes the tags of the book in loan views', async () => {
+    const member = await api.request('POST', '/members', {
+      name: 'Tag Reader',
+      email: `tag-reader-${Math.random().toString(16).slice(2, 8)}@example.com`,
+    });
+    const book = await add(['Adventure']);
+
+    const loan = await api.request('POST', '/loans', { memberId: member.body.id, bookId: book.body.id });
+    assert.equal(loan.status, 201);
+    assert.deepEqual(loan.body.book.tags, ['adventure']);
+  });
+});

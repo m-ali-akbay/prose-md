@@ -57,7 +57,7 @@ async function dispatch(
     json(res, 200, {
       service: 'library',
       status: 'ok',
-      resources: ['/health', '/books', '/members', '/loans'],
+      resources: ['/health', '/books', '/members', '/loans', '/members/:id/fines'],
     });
     return;
   }
@@ -103,6 +103,7 @@ async function handleBooks(
         title: readQueryString(query.get('title'), 'title'),
         author: readQueryString(query.get('author'), 'author'),
         isbn: readQueryString(query.get('isbn'), 'isbn'),
+        tag: readQueryString(query.get('tag'), 'tag'),
       };
       json(res, 200, { books: library.listBooks(filter) });
       return;
@@ -185,6 +186,18 @@ async function handleMembers(
       json(res, 200, library.unsuspendMember(memberId, now));
       return;
     }
+    if (action === 'fines') {
+      if (method !== 'GET') throw methodNotAllowed(method, ['GET']);
+      json(res, 200, library.fines(memberId, now));
+      return;
+    }
+  }
+
+  if (rest.length === 3 && rest[1] === 'fines' && rest[2] === 'pay') {
+    if (method !== 'POST') throw methodNotAllowed(method, ['POST']);
+    const body = await readJsonBody(req, true);
+    json(res, 200, library.payFines(memberId, body, now));
+    return;
   }
 
   throw notFound(`Unknown member resource "/members/${rest.join('/')}"`);
