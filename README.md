@@ -16,7 +16,7 @@ Requires Docker. The target language, frameworks and layout come from the specs 
 ```
 prose build [--dry] [--fresh] [--effort low|high|max] [--report FILE] [--param key=value]... ["instruction"]
 prose status     md changes since the last build, and hand edits in out/
-prose check      exit 1 if md files changed or out/ was edited by hand (no LLM call)
+prose check [--param key=value]...   CI mode (see below)
 ```
 
 - `--dry`: run the build but apply nothing.
@@ -36,9 +36,10 @@ Container layout:
 - `/prose` (ro): `diff.patch` (md changes since the last build), `params.json`, `hand-edited.txt`
 - `/work`: a copy of `out/`. On `finish`, `/work` becomes `out/`: new/changed files are written, missing ones deleted, modes kept. Whatever is left in it is copied, so the agent cleans up after itself.
 
-The agent has four tools:
+The agent has five tools:
 
 - `bash`: run a command in the container.
+- `view_image(path)`: look at a PNG/JPEG/GIF/WebP file (up to ~8 MB) from the container, see Images below.
 - `raise(severity, message, location?)`: `info` / `warning` / `error`. Any number of times; records an issue (decisions, assumptions, ambiguities, risks) without stopping the build.
 - `finish(summary)`: apply `/work` to `out/`.
 - `fail(reason)`: abort. Nothing is applied and `out/` is unchanged (contradictory or too ambiguous specs). No interactive prompts, so it runs in CI.
@@ -52,6 +53,33 @@ The new `out/` and the new `.prose/` (snapshot, lock, history) are staged in `.p
 ### `out/` is generated-only
 
 Files are written read-only. `prose check` fails if `out/` was changed by hand. The next build discards hand edits by regenerating those files from the specs (the agent is told which files diverged and raises a warning).
+
+## Images (vision)
+
+Put images next to your specs (UI mockups, diagrams, screenshots; `.png .jpg .jpeg .gif .webp`, anywhere in the project except `out/`, `.prose/`, `node_modules`). They are copied into `/specs`, listed in the agent's first message, and the agent looks at them with `view_image`. It can also look at its own results: render the output in the container (headless browser screenshot, a generated chart, ...) and view that.
+
+- Image changes count like spec changes: their hashes are in `lock.json`, a changed, added or deleted image triggers a rebuild and is shown by `status` and `check`.
+- Images are not kept in `history.json` (replaced by a placeholder), and count as ~1000 tokens each toward the compaction limits instead of their base64 size.
+- Needs a vision-capable model (`deepseek-flash` is). Only tested against DeepSeek.
+
+## CI mode: `prose check`
+
+Read-only verification that the last build is still valid. It needs no API key, Docker or network, and reports every problem it finds, then exits 1:
+
+- never built (no snapshot in `.prose/`)
+- md or image files changed since the last build
+- `out/` differs from the last build (edited, deleted or added by hand)
+- a previous build was interrupted (`.prose-staging` exists)
+- with `--param key=value`: the build parameters differ from the ones the last build used
+
+Commit `.prose/` and `out/` together with the specs, then in CI, for example:
+
+```yaml
+- uses: actions/checkout@v4
+- uses: actions/setup-node@v4
+- run: npm ci   # in the prose checkout
+- run: npx tsx /path/to/prose/src/cli.ts check
+```
 
 ## History
 

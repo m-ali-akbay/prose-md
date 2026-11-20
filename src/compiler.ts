@@ -1,11 +1,11 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import OpenAI from "openai";
-import { diffMds, hasChanges } from "./diff.js";
+import { diffAssets, diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
-import { History, Msg, OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
+import { History, Msg, OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readAssets, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 13;
+export const PROMPT_VERSION = 14;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -25,6 +25,7 @@ Rules:
 - out/ is generated output and must never be edited by hand. Do not preserve manual edits: for every file listed in hand-edited.txt, regenerate it from the specs (restore deleted files, remove added files that the specs do not call for) and raise a warning naming those files.
 - Include whatever the specs imply (tests, build files, a README for the output) in /work.
 - Build and run the tests you wrote and fix failures before finishing.
+- Specs may come with images stored next to them in /specs (UI mockups, diagrams, screenshots). Look at the relevant ones with view_image before implementing, and follow them. You can also check visual results yourself: render your output in the container (e.g. a headless browser screenshot, or an image your program produces) and view it. Images must be PNG, JPEG, GIF or WebP and under about 8 MB (convert or downscale with ImageMagick or similar). Each view costs up to ~1000 tokens and stays in the conversation for the rest of the build, so view only what you need. Images are not kept in the history of later builds.
 - Every tool result is re-sent with every later request, so read economically: look at file sizes first (wc -l), do not cat large files whole, prefer grep -n and sed -n 'START,ENDp' for the parts you need, read each part once, and edit with targeted replacements instead of re-printing or rewriting whole files. Command output over ~20000 characters is cut in the middle.
 - Use raise (as often as you like) to report things the author should know, with a severity: "info" (a notable decision), "warning" (an ambiguity you resolved by assuming something, a spec smell, a risk, a test you could not make pass), "error" (something is wrong but you could still finish). Raised issues are recorded in the build report; raising does not stop the build. Reference the spec file and line in the location field when you can.
 - If the specs are contradictory or too ambiguous to implement without guessing something important, call fail with a short explanation of what the author must fix. Nothing is applied then.
@@ -39,6 +40,14 @@ const tools: OpenAI.Chat.ChatCompletionTool[] = [
       name: "bash",
       description: "Run a bash command as root in the container (cwd /work). Installed packages and files persist between calls.",
       parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "view_image",
+      description: "Look at an image file (PNG, JPEG, GIF or WebP, up to ~8 MB) from the container, e.g. a mockup in /specs or a screenshot you made. The image is returned to you.",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
     },
   },
   {
@@ -124,6 +133,8 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
   await recover(o.root);
   const snap = await loadSnapshot(o.root);
   const mds = await readMds(o.root);
+  const assets = await readAssets(o.root);
+  const assetChanges = diffAssets(snap.assets, assets);
   const changes = diffMds(snap.mds, mds);
   const outBase = path.join(o.root, OUT_DIR);
   const current = await readTree(outBase);
@@ -134,7 +145,8 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
   }
   const paramsChanged = JSON.stringify(sortKeys(params)) !== JSON.stringify(sortKeys(snap.meta.params ?? {}));
   const d = drift(snap.outputs, current);
-  if (!hasChanges(changes) && !paramsChanged && !o.instruction && d.modified.length + d.missing.length + d.extra.length === 0) return { status: "unchanged" };
+  if (!hasChanges(changes) && !assetChanges.any && !paramsChanged && !o.instruction && d.modified.length + d.missing.length + d.extra.length === 0) return { status: "unchanged" };
+  const fullPatch = [changes.patch, assetChanges.patch].filter(Boolean).join("\n");
   const handEdited = [...d.modified, ...d.missing, ...d.extra].sort();
 
   const issues: Issue[] = [];
@@ -160,7 +172,11 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       await fs.mkdir(path.dirname(path.join(sb.specs, f)), { recursive: true });
       await fs.writeFile(path.join(sb.specs, f), c);
     }
-    await fs.writeFile(path.join(sb.prose, "diff.patch"), changes.patch);
+    await fs.writeFile(path.join(sb.prose, "diff.patch"), fullPatch);
+    for (const f of Object.keys(assets)) {
+      await fs.mkdir(path.dirname(path.join(sb.specs, f)), { recursive: true });
+      await fs.copyFile(path.join(o.root, f), path.join(sb.specs, f));
+    }
     if (Object.keys(params).length) await fs.writeFile(path.join(sb.prose, "params.json"), JSON.stringify(params, null, 2) + "\n");
     if (handEdited.length) await fs.writeFile(path.join(sb.prose, "hand-edited.txt"), handEdited.join("\n") + "\n");
     await sb.start(o.image, log);
@@ -174,12 +190,14 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       "## Spec files in /specs",
       Object.keys(mds).join("\n") || "(none)",
       "",
+      Object.keys(assets).length ? `## Image files in /specs (view with view_image)\n${Object.keys(assets).join("\n")}\n` : "",
+      "",
       "## Files in /work",
       Object.keys(current).join("\n") || "(empty)",
       "",
       handEdited.length ? `## Changed by hand since last build (discard these edits, regenerate from the specs)\n${handEdited.join("\n")}\n` : "",
-      "## md diff (also in /prose/diff.patch)",
-      changes.patch,
+      "## Changes (also in /prose/diff.patch)",
+      fullPatch,
     ].join("\n");
 
     const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
@@ -202,7 +220,8 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       { role: "user", content: intro + first },
     ];
     let startIdx = 1 + priorMsgs.length;
-    const sizeOf = (ms: unknown[]) => JSON.stringify(ms).length;
+    // images count by their token cost (~1000 tokens), not by their base64 length
+    const sizeOf = (ms: unknown[]) => JSON.stringify(ms, (_k, v) => (typeof v === "string" && v.startsWith("data:image/") ? IMAGE_COST : v)).length;
 
     /**
      * Shrink the live conversation to about `target` chars: the newest messages of this build stay raw
@@ -275,12 +294,23 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
         continue;
       }
       for (const c of calls) {
-        let out: string;
+        let out: string | object[];
         try {
           const args = JSON.parse(c.function.arguments || "{}");
           if (c.function.name === "bash") {
             log(`  bash: ${String(args.command).split("\n")[0].slice(0, 160)}`);
             out = await sb.exec(String(args.command ?? ""));
+          } else if (c.function.name === "view_image") {
+            const p = String(args.path ?? "");
+            log(`  view_image ${p}`);
+            const buf = await sb.readFile(p, MAX_IMAGE_BYTES);
+            const mime = sniffImage(buf);
+            out = mime
+              ? [
+                  { type: "text", text: `Image ${p} (${mime}, ${buf.length} bytes):` },
+                  { type: "image_url", image_url: { url: `data:${mime};base64,${buf.toString("base64")}` } },
+                ]
+              : "error: not a PNG/JPEG/GIF/WebP image; convert it first (e.g. ImageMagick: convert in.svg out.png)";
           } else if (c.function.name === "raise") {
             const sev = ["info", "warning", "error"].includes(args.severity) ? (args.severity as Severity) : "warning";
             const issue: Issue = { severity: sev, message: String(args.message ?? ""), ...(args.location ? { location: String(args.location) } : {}) };
@@ -301,7 +331,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
         } catch (e) {
           out = `error: ${(e as Error).message}`;
         }
-        messages.push({ role: "tool", tool_call_id: c.id, content: out });
+        messages.push({ role: "tool", tool_call_id: c.id, content: out } as OpenAI.Chat.ChatCompletionMessageParam);
       }
     }
 
@@ -334,6 +364,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     }
     await saveSnapshot(path.join(staging, "state"), {
       mds,
+      assets,
       outputs: Object.fromEntries(Object.entries(next).map(([f, v]) => [f, hash(v.data)])),
       meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString(), params },
       history: { key, builds: [...prior, messages.slice(startIdx).map(slim)] },
@@ -355,7 +386,22 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
 /** Keep only what is needed to replay a message (drops reasoning_content etc.). */
 function slim(m: Msg): Msg {
   if (m.role === "assistant") return { role: "assistant", content: m.content ?? null, ...(m.tool_calls?.length ? { tool_calls: m.tool_calls } : {}) };
+  if (m.role === "tool" && Array.isArray(m.content)) {
+    // images are not kept in the saved history
+    return { ...m, content: m.content.map((p: any) => (p.type === "text" ? p.text : "[image omitted from saved history]")).join("\n") };
+  }
   return m;
+}
+
+const IMAGE_COST = "i".repeat(3000);
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+function sniffImage(b: Buffer): string | undefined {
+  if (b.length > 12 && b.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (b.length > 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return "image/jpeg";
+  if (b.length > 6 && b.subarray(0, 4).toString("latin1") === "GIF8") return "image/gif";
+  if (b.length > 12 && b.subarray(0, 4).toString("latin1") === "RIFF" && b.subarray(8, 12).toString("latin1") === "WEBP") return "image/webp";
+  return undefined;
 }
 
 const histSize = (b: Msg[][]) => JSON.stringify(b).length;

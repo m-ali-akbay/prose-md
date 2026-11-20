@@ -69,6 +69,17 @@ export class Sandbox {
     return out;
   }
 
+  /** Read a (binary) file from inside the container. */
+  readFile(p: string, maxBytes: number): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+      execFile("docker", ["exec", this.name, "cat", p], { encoding: "buffer", maxBuffer: maxBytes, timeout: 60_000 }, (err, stdout, stderr) => {
+        if (!err) return resolve(stdout);
+        if ((err as any).code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") return reject(new Error(`file is larger than ${maxBytes} bytes; downscale it first`));
+        reject(new Error(stderr.toString().trim() || (err as Error).message));
+      });
+    });
+  }
+
   /** Give the host user ownership of root-created files so they can be read/removed. */
   async chown() {
     if (process.getuid && process.getgid) {

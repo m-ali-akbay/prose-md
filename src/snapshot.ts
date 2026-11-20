@@ -20,6 +20,8 @@ export interface History {
 
 export interface Snapshot {
   history?: History;
+  /** image files next to the specs (relative path -> sha256) as of the last build */
+  assets: Record<string, string>;
   /** md files as of the last successful build (relative path -> content) */
   mds: Record<string, string>;
   /** output files as of the last successful build (relative to out/ -> sha256) */
@@ -42,6 +44,16 @@ async function walk(dir: string, base: string, filter: (p: string) => boolean, s
     else if (filter(e.name)) res.push(path.relative(base, full).split(path.sep).join("/"));
   }
   return res.sort();
+}
+
+export const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
+
+/** Image files next to the specs (mockups, diagrams, ...): relative path -> sha256. */
+export async function readAssets(root: string): Promise<Record<string, string>> {
+  const files = await walk(root, root, (n) => IMAGE_EXT.test(n), true);
+  const out: Record<string, string> = {};
+  for (const f of files) out[f] = hash(await fs.readFile(path.join(root, f)));
+  return out;
 }
 
 export async function readMds(root: string): Promise<Record<string, string>> {
@@ -75,10 +87,11 @@ export function drift(lock: Record<string, string>, current: Record<string, { da
 
 export async function loadSnapshot(root: string): Promise<Snapshot> {
   const state = path.join(root, STATE_DIR);
-  const snap: Snapshot = { mds: {}, outputs: {}, meta: {} };
+  const snap: Snapshot = { mds: {}, outputs: {}, assets: {}, meta: {} };
   try {
     const lock = JSON.parse(await fs.readFile(path.join(state, "lock.json"), "utf8"));
     snap.outputs = lock.outputs ?? {};
+    snap.assets = lock.assets ?? {};
     snap.meta = lock.meta ?? {};
   } catch {}
   try {
@@ -102,6 +115,6 @@ export async function saveSnapshot(state: string, snap: Snapshot): Promise<void>
   if (snap.history) await fs.writeFile(path.join(state, "history.json"), JSON.stringify(snap.history));
   await fs.writeFile(
     path.join(state, "lock.json"),
-    JSON.stringify({ meta: snap.meta, outputs: snap.outputs }, null, 2) + "\n",
+    JSON.stringify({ meta: snap.meta, outputs: snap.outputs, ...(Object.keys(snap.assets).length ? { assets: snap.assets } : {}) }, null, 2) + "\n",
   );
 }
