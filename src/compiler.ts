@@ -5,7 +5,7 @@ import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
 import { OUT_DIR, STAGING_DIR, STATE_DIR, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 2;
+export const PROMPT_VERSION = 3;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -15,19 +15,18 @@ You have a disposable Docker container where you are root, with network access. 
 Layout inside the container:
 - /specs   (read-only) all markdown specs, same paths as in the project
 - /prose   (read-only) diff.patch = md changes since the last build; hand-edited.txt = files in /work edited by hand since the last build (may be absent)
-- /state   notes.md = your own notes from the previous build (read and rewrite it)
 - /work    the output. It starts as a copy of the current out/. When you call finish, /work BECOMES out/: new and changed files are written, files missing from /work are deleted. Build artifacts and dependency directories you leave there will be copied too, so clean them up before finishing.
 
 Rules:
 - The markdown files are the only source of truth. Never edit them.
 - Specs contain no signatures or interfaces; you design those and keep them consistent.
-- The target language(s), frameworks and layout come from the specs (stated in prose in any md file). If none is stated, pick a sensible default and record it in the notes.
+- The target language(s), frameworks and layout come from the specs (stated in prose in any md file). If none is stated, pick a sensible default and record it somewhere in /work (README or notes).
 - Work incrementally: start from the diff and the existing /work contents. Change only what the diff requires; create, update or delete files as needed. If the target language changes, remove the old outputs.
 - Files listed in hand-edited.txt were edited by hand; preserve their intent unless the specs contradict them.
 - Include whatever the specs imply (tests, build files, a README for the output) in /work.
 - Build and run the tests you wrote and fix failures before finishing.
-- If the specs are contradictory or too ambiguous to implement without guessing something important, call finish with error set to a short explanation of what the author must fix. Nothing is applied then. Resolve minor ambiguity yourself and mention the assumption in the notes.
-- Before finishing, rewrite /state/notes.md in full: structure, key decisions, assumptions, which spec maps to which files, anything pending. It is for your future self.
+- If the specs are contradictory or too ambiguous to implement without guessing something important, call finish with error set to a short explanation of what the author must fix. Nothing is applied then. Resolve minor ambiguity yourself and document the assumption in /work.
+- You have no memory between builds except what is in /work. If it helps your future self (structure, design decisions, assumptions, which spec maps to which files), keep notes in a file inside /work (e.g. NOTES.md) and keep them current; otherwise don't bother.
 - Nothing is applied until you call finish.`;
 
 const tools: OpenAI.Chat.ChatCompletionTool[] = [
@@ -97,15 +96,11 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     }
     await fs.writeFile(path.join(sb.prose, "diff.patch"), changes.patch);
     if (handEdited.length) await fs.writeFile(path.join(sb.prose, "hand-edited.txt"), handEdited.join("\n") + "\n");
-    await fs.writeFile(path.join(sb.state, "notes.md"), snap.notes);
     await sb.start(o.image, log);
 
     const first = [
       `Changes since last build: ${changes.added.length} added, ${changes.modified.length} modified, ${changes.deleted.length} deleted md files.`,
       snap.meta.builtAt ? `Last build: ${snap.meta.builtAt}` : "This is the first build (empty snapshot, empty /work).",
-      "",
-      "## /state/notes.md (from the previous build)",
-      snap.notes || "(none)",
       "",
       "## Spec files in /specs",
       Object.keys(mds).join("\n") || "(none)",
@@ -129,7 +124,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
 
     for (let turn = 0; turn < maxTurns && !finished; turn++) {
       if (turn === maxTurns - 15) {
-        messages.push({ role: "user", content: "You are running out of turns. Stop refining, update /state/notes.md and call finish within a few turns." });
+        messages.push({ role: "user", content: "You are running out of turns. Stop refining, call finish within a few turns." });
       }
       const res = await client.chat.completions.create({ model: o.model, messages, tools });
       const msg = res.choices[0].message;
@@ -176,9 +171,6 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     const deleted = Object.keys(current).filter((f) => !(f in next));
     if (o.dry) return { status: "built", summary: finished.summary, written, deleted };
 
-    let notes = snap.notes;
-    try { notes = await fs.readFile(path.join(sb.state, "notes.md"), "utf8"); } catch {}
-
     // Stage the complete new out/ and .prose/ side by side, then swap both in.
     const staging = path.join(o.root, STAGING_DIR);
     await fs.rm(staging, { recursive: true, force: true });
@@ -192,7 +184,6 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     await saveSnapshot(path.join(staging, "state"), {
       mds,
       outputs: Object.fromEntries(Object.entries(next).map(([f, v]) => [f, hash(v.data)])),
-      notes,
       meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString() },
     });
     const stateDir = path.join(o.root, STATE_DIR);

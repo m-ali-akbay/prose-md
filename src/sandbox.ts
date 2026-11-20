@@ -16,18 +16,15 @@ const run = (args: string[], timeout = 60_000) =>
  *   /work   rw  copy of out/ (whatever is here at the end becomes out/)
  *   /specs  ro  the current markdown specs
  *   /prose  ro  build context (diff, hand-edited files)
- *   /state  rw  notes.md carried between builds
  */
 export class Sandbox {
   readonly work: string;
   readonly specs: string;
   readonly prose: string;
-  readonly state: string;
   private constructor(private name: string, private base: string) {
     this.work = path.join(base, "work");
     this.specs = path.join(base, "specs");
     this.prose = path.join(base, "prose");
-    this.state = path.join(base, "state");
   }
 
   static async checkDocker() {
@@ -39,7 +36,7 @@ export class Sandbox {
     await Sandbox.checkDocker();
     const base = await fs.mkdtemp(path.join(os.tmpdir(), "prose-"));
     const sb = new Sandbox(`prose-${path.basename(base).slice(6)}`, base);
-    for (const d of [sb.work, sb.specs, sb.prose, sb.state]) await fs.mkdir(d);
+    for (const d of [sb.work, sb.specs, sb.prose]) await fs.mkdir(d);
     return sb;
   }
 
@@ -49,7 +46,7 @@ export class Sandbox {
       [
         "run", "-d", "--name", this.name,
         "-v", `${this.work}:/work`, "-v", `${this.specs}:/specs:ro`,
-        "-v", `${this.prose}:/prose:ro`, "-v", `${this.state}:/state`,
+        "-v", `${this.prose}:/prose:ro`,
         "-w", "/work", "-e", "CI=1", "-e", "DEBIAN_FRONTEND=noninteractive",
         image, "sleep", "infinity",
       ],
@@ -68,7 +65,7 @@ export class Sandbox {
   /** Give the host user ownership of root-created files so they can be read/removed. */
   async chown() {
     if (process.getuid && process.getgid) {
-      await run(["exec", this.name, "chown", "-R", `${process.getuid()}:${process.getgid()}`, "/work", "/state"], 300_000);
+      await run(["exec", this.name, "chown", "-R", `${process.getuid()}:${process.getgid()}`, "/work"], 300_000);
     }
   }
 

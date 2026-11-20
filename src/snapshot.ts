@@ -14,7 +14,6 @@ export interface Snapshot {
   mds: Record<string, string>;
   /** output files as of the last successful build (relative to out/ -> sha256) */
   outputs: Record<string, string>;
-  notes: string;
   meta: { model?: string; promptVersion?: number; builtAt?: string };
 }
 
@@ -57,14 +56,11 @@ export async function readTree(base: string): Promise<Record<string, { data: Buf
 
 export async function loadSnapshot(root: string): Promise<Snapshot> {
   const state = path.join(root, STATE_DIR);
-  const snap: Snapshot = { mds: {}, outputs: {}, notes: "", meta: {} };
+  const snap: Snapshot = { mds: {}, outputs: {}, meta: {} };
   try {
     const lock = JSON.parse(await fs.readFile(path.join(state, "lock.json"), "utf8"));
     snap.outputs = lock.outputs ?? {};
     snap.meta = lock.meta ?? {};
-  } catch {}
-  try {
-    snap.notes = await fs.readFile(path.join(state, "notes.md"), "utf8");
   } catch {}
   const mdBase = path.join(state, "md");
   for (const f of await walk(mdBase, mdBase, () => true, false)) {
@@ -81,7 +77,6 @@ export async function saveSnapshot(state: string, snap: Snapshot): Promise<void>
     await fs.writeFile(p, content);
   }
   await fs.mkdir(state, { recursive: true });
-  await fs.writeFile(path.join(state, "notes.md"), snap.notes);
   await fs.writeFile(
     path.join(state, "lock.json"),
     JSON.stringify({ meta: snap.meta, outputs: snap.outputs }, null, 2) + "\n",
