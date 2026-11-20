@@ -1,0 +1,84 @@
+import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
+import path from "node:path";
+
+export const OUT_DIR = "out";
+export const STATE_DIR = ".prose";
+const IGNORED = new Set(["node_modules", STATE_DIR, OUT_DIR, ".git", "dist"]);
+
+export const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+
+export interface Snapshot {
+  /** md files as of the last successful build (relative path -> content) */
+  mds: Record<string, string>;
+  /** output files as of the last successful build (relative to out/ -> sha256) */
+  outputs: Record<string, string>;
+  notes: string;
+  meta: { model?: string; promptVersion?: number; builtAt?: string };
+}
+
+async function walk(dir: string, base: string, filter: (p: string) => boolean, skip: boolean): Promise<string[]> {
+  const res: string[] = [];
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return res;
+  }
+  for (const e of entries) {
+    if (skip && IGNORED.has(e.name)) continue;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) res.push(...(await walk(full, base, filter, skip)));
+    else if (filter(e.name)) res.push(path.relative(base, full).split(path.sep).join("/"));
+  }
+  return res.sort();
+}
+
+export async function readMds(root: string): Promise<Record<string, string>> {
+  const files = await walk(root, root, (n) => n.toLowerCase().endsWith(".md"), true);
+  const out: Record<string, string> = {};
+  for (const f of files) out[f] = await fs.readFile(path.join(root, f), "utf8");
+  return out;
+}
+
+export async function readOutputs(root: string): Promise<Record<string, string>> {
+  const base = path.join(root, OUT_DIR);
+  const files = await walk(base, base, () => true, false);
+  const out: Record<string, string> = {};
+  for (const f of files) out[f] = await fs.readFile(path.join(base, f), "utf8");
+  return out;
+}
+
+export async function loadSnapshot(root: string): Promise<Snapshot> {
+  const state = path.join(root, STATE_DIR);
+  const snap: Snapshot = { mds: {}, outputs: {}, notes: "", meta: {} };
+  try {
+    const lock = JSON.parse(await fs.readFile(path.join(state, "lock.json"), "utf8"));
+    snap.outputs = lock.outputs ?? {};
+    snap.meta = lock.meta ?? {};
+  } catch {}
+  try {
+    snap.notes = await fs.readFile(path.join(state, "notes.md"), "utf8");
+  } catch {}
+  const mdBase = path.join(state, "md");
+  for (const f of await walk(mdBase, mdBase, () => true, false)) {
+    snap.mds[f] = await fs.readFile(path.join(mdBase, f), "utf8");
+  }
+  return snap;
+}
+
+export async function saveSnapshot(root: string, snap: Snapshot): Promise<void> {
+  const state = path.join(root, STATE_DIR);
+  await fs.rm(path.join(state, "md"), { recursive: true, force: true });
+  for (const [f, content] of Object.entries(snap.mds)) {
+    const p = path.join(state, "md", f);
+    await fs.mkdir(path.dirname(p), { recursive: true });
+    await fs.writeFile(p, content);
+  }
+  await fs.mkdir(state, { recursive: true });
+  await fs.writeFile(path.join(state, "notes.md"), snap.notes);
+  await fs.writeFile(
+    path.join(state, "lock.json"),
+    JSON.stringify({ meta: snap.meta, outputs: snap.outputs }, null, 2) + "\n",
+  );
+}

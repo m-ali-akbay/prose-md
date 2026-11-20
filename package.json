@@ -1,0 +1,23 @@
+{
+  "name": "prose",
+  "version": "0.1.0",
+  "description": "Compile markdown specs into code with an LLM agent.",
+  "type": "module",
+  "bin": {
+    "prose": "dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prose": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "diff": "^9.0.0",
+    "openai": "^7.60.0"
+  },
+  "devDependencies": {
+    "@types/diff": "^7.0.2",
+    "@types/node": "^26.6.6",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
