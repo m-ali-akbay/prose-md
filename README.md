@@ -14,16 +14,17 @@ Requires Docker. The target language, frameworks and layout come from the specs 
 ## Commands
 
 ```
-prose build [--dry] [--fresh] [--effort low|high|max] [--param key=value]... ["instruction"]
+prose build [--dry] [--fresh] [--effort low|high|max] [--report FILE] [--param key=value]... ["instruction"]
 prose status     md changes since the last build, and hand edits in out/
 prose check      exit 1 if md files changed or out/ was edited by hand (no LLM call)
 ```
 
 - `--dry`: run the build but apply nothing.
+- `--report FILE`: also write the build report (JSON: status, summary, changed files, raised issues, token usage, params, instruction) to FILE. Written for successful, dry and failed builds; never stored in `.prose/`. Without it, the same information is only printed.
 - `--fresh`: ignore the saved model conversation.
 - `--effort low|high|max`: the model's thinking effort, sent as `reasoning_effort` (default `low`; also `PROSE_EFFORT`). Thinking tokens are billed as output, which is most of a build's cost. Only tested against DeepSeek.
 - `--param key=value` (repeatable): build parameters handed to the agent as `/prose/params.json` (target, environment, ...). They are remembered in `lock.json`, a changed value triggers a rebuild even if the specs did not change, and `--param key=` removes one.
-- `"instruction"`: free text for this one build. Not remembered; forces a build; recorded in `report.json`.
+- `"instruction"`: free text for this one build. Not remembered; forces a build.
 
 ## How it works
 
@@ -42,11 +43,11 @@ The agent has four tools:
 - `finish(summary)`: apply `/work` to `out/`.
 - `fail(reason)`: abort. Nothing is applied and `out/` is unchanged (contradictory or too ambiguous specs). No interactive prompts, so it runs in CI.
 
-Every build writes `.prose/report.json` (status, summary, changed files, raised issues, token usage). A failed build updates only the report.
+Raised issues, the summary and token usage are printed at the end of every build. A failed build changes nothing on disk.
 
 ### Atomic apply
 
-The new `out/` and the new `.prose/` (snapshot, lock, report, history) are staged in `.prose-staging/` and swapped in together. A crash mid-swap is rolled back on the next run.
+The new `out/` and the new `.prose/` (snapshot, lock, history) are staged in `.prose-staging/` and swapped in together. A crash mid-swap is rolled back on the next run.
 
 ### `out/` is generated-only
 

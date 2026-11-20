@@ -16,10 +16,11 @@ async function loadDotEnv(root: string) {
 
 const HELP = `prose - compile markdown into code
 
-  prose build [--dry] [--fresh] [--effort low|high|max] [--param key=value]... ["instruction"]
+  prose build [--dry] [--fresh] [--effort low|high|max] [--report FILE] [--param key=value]... ["instruction"]
                         compile md changes into out/. The agent works in a root
                         Docker container (build, test, install anything).
                         --effort: model thinking effort (default low; env PROSE_EFFORT).
+                        --report: also write the build report (JSON) to FILE.
                         --fresh: ignore the saved model conversation (.prose/history.json).
                         --param: build parameters given to the agent (target, env, ...).
                           Remembered across builds; changing one triggers a rebuild;
@@ -47,6 +48,7 @@ async function main() {
   const params: Record<string, string> = {};
   const words: string[] = [];
   let effortArg: string | undefined;
+  let reportArg: string | undefined;
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
     if (a === "--param" || a.startsWith("--param=")) {
@@ -57,6 +59,8 @@ async function main() {
         process.exit(1);
       }
       params[kv.slice(0, eq)] = kv.slice(eq + 1);
+    } else if (a === "--report" || a.startsWith("--report=")) {
+      reportArg = a === "--report" ? rest[++i] : a.slice("--report=".length);
     } else if (a === "--effort" || a.startsWith("--effort=")) {
       effortArg = a === "--effort" ? rest[++i] : a.slice("--effort=".length);
     } else if (a.startsWith("--")) flags.push(a);
@@ -101,6 +105,7 @@ async function main() {
       dry: flags.includes("--dry"),
       fresh: flags.includes("--fresh"),
       effort: effort as Effort,
+      reportFile: reportArg,
       historyLimit: process.env.PROSE_HISTORY_LIMIT ? Number(process.env.PROSE_HISTORY_LIMIT) : undefined,
       historyMax: process.env.PROSE_HISTORY_MAX ? Number(process.env.PROSE_HISTORY_MAX) : undefined,
       historyTarget: process.env.PROSE_HISTORY_TARGET ? Number(process.env.PROSE_HISTORY_TARGET) : undefined,

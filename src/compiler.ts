@@ -5,7 +5,7 @@ import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
 import { History, Msg, OUT_DIR, STAGING_DIR, STATE_DIR, drift, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 12;
+export const PROMPT_VERSION = 13;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
 Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
@@ -99,6 +99,8 @@ export interface BuildOptions {
   historyTarget?: number;
   /** thinking effort sent to the model as reasoning_effort (default "low") */
   effort?: Effort;
+  /** also write the build report (JSON) to this file; never stored in .prose/ */
+  reportFile?: string;
   /** ignore the saved conversation and start from scratch */
   fresh?: boolean;
   /** key=value build parameters; merged over the previous build's (empty value removes) */
@@ -138,12 +140,14 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
   const issues: Issue[] = [];
   const usage = { prompt: 0, cached: 0, completion: 0 };
   const report = (r: object) => JSON.stringify({ model: o.model, effort: o.effort ?? "low", at: new Date().toISOString(), params, ...(o.instruction ? { instruction: o.instruction } : {}), tokens: usage, issues, ...r }, null, 2) + "\n";
+  const writeReport = async (r: object) => {
+    if (!o.reportFile) return;
+    const file = path.resolve(o.root, o.reportFile);
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, report(r));
+  };
   const failed = async (reason: string): Promise<BuildResult> => {
-    if (!o.dry) {
-      // out/ and the snapshot stay as they were; only the report is updated
-      await fs.mkdir(path.join(o.root, STATE_DIR), { recursive: true });
-      await fs.writeFile(path.join(o.root, STATE_DIR, "report.json"), report({ status: "failed", reason }));
-    }
+    await writeReport({ status: "failed", reason });
     return { status: "failed", reason, issues };
   };
 
@@ -313,7 +317,10 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       (a.mode & 0o555) === (b.mode & 0o555) && a.data.equals(b.data);
     const written = Object.keys(next).filter((f) => !current[f] || !same(current[f], next[f]));
     const deleted = Object.keys(current).filter((f) => !(f in next));
-    if (o.dry) return { status: "built", summary, written, deleted, issues };
+    if (o.dry) {
+      await writeReport({ status: "built", dry: true, summary, written, deleted });
+      return { status: "built", summary, written, deleted, issues };
+    }
 
     // Stage the complete new out/ and .prose/ side by side, then swap both in.
     const staging = path.join(o.root, STAGING_DIR);
@@ -331,7 +338,6 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
       meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString(), params },
       history: { key, builds: [...prior, messages.slice(startIdx).map(slim)] },
     });
-    await fs.writeFile(path.join(staging, "state", "report.json"), report({ status: "built", summary, written, deleted }));
     const stateDir = path.join(o.root, STATE_DIR);
     await fs.rm(path.join(staging, "old-out"), { recursive: true, force: true });
     await fs.rename(outBase, path.join(staging, "old-out")).catch(() => {});
@@ -339,6 +345,7 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     await fs.rename(stateDir, path.join(staging, "old-state")).catch(() => {});
     await fs.rename(path.join(staging, "state"), stateDir);
     await fs.rm(staging, { recursive: true, force: true });
+    await writeReport({ status: "built", summary, written, deleted });
     return { status: "built", summary, written, deleted, issues };
   } finally {
     await sb.destroy();
