@@ -11,39 +11,51 @@ const run = (args: string[], timeout = 60_000) =>
   });
 
 /**
- * A disposable Docker container the agent has full root control over:
- * network access, package installs, any tool. Staged outputs are synced into /work.
+ * A disposable Docker container the agent has full root control over
+ * (network, package installs, any tool). Host dirs are bind-mounted:
+ *   /work   rw  copy of out/ (whatever is here at the end becomes out/)
+ *   /specs  ro  the current markdown specs
+ *   /prose  ro  build context (diff, hand-edited files)
+ *   /state  rw  notes.md carried between builds
  */
 export class Sandbox {
-  private synced = new Set<string>();
-  private constructor(private name: string, private dir: string) {}
-
-  static async start(image: string, log: (s: string) => void): Promise<Sandbox> {
-    const v = await run(["version", "--format", "{{.Server.Version}}"], 15_000);
-    if (v.code !== 0) throw new Error("Docker is not available. Start Docker, or pass --no-sandbox to build without running commands.");
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "prose-"));
-    const name = `prose-${path.basename(dir).slice(6)}`;
-    log(`sandbox: starting ${image}`);
-    const r = await run(
-      ["run", "-d", "--name", name, "-v", `${dir}:/work`, "-w", "/work", "-e", "CI=1", "-e", "DEBIAN_FRONTEND=noninteractive", image, "sleep", "infinity"],
-      600_000,
-    );
-    if (r.code !== 0) {
-      await fs.rm(dir, { recursive: true, force: true });
-      throw new Error(`failed to start sandbox: ${r.stderr}`);
-    }
-    return new Sandbox(name, dir);
+  readonly work: string;
+  readonly specs: string;
+  readonly prose: string;
+  readonly state: string;
+  private constructor(private name: string, private base: string) {
+    this.work = path.join(base, "work");
+    this.specs = path.join(base, "specs");
+    this.prose = path.join(base, "prose");
+    this.state = path.join(base, "state");
   }
 
-  /** Mirror the staged outputs into /work (root of out/). */
-  async sync(files: Record<string, string>) {
-    for (const f of this.synced) if (!(f in files)) await fs.rm(path.join(this.dir, f), { force: true });
-    this.synced.clear();
-    for (const [f, c] of Object.entries(files)) {
-      await fs.mkdir(path.dirname(path.join(this.dir, f)), { recursive: true });
-      await fs.writeFile(path.join(this.dir, f), c);
-      this.synced.add(f);
-    }
+  static async checkDocker() {
+    const v = await run(["version", "--format", "{{.Server.Version}}"], 15_000);
+    if (v.code !== 0) throw new Error("Docker is not available. Start Docker and try again.");
+  }
+
+  static async create(): Promise<Sandbox> {
+    await Sandbox.checkDocker();
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), "prose-"));
+    const sb = new Sandbox(`prose-${path.basename(base).slice(6)}`, base);
+    for (const d of [sb.work, sb.specs, sb.prose, sb.state]) await fs.mkdir(d);
+    return sb;
+  }
+
+  async start(image: string, log: (s: string) => void) {
+    log(`sandbox: starting ${image}`);
+    const r = await run(
+      [
+        "run", "-d", "--name", this.name,
+        "-v", `${this.work}:/work`, "-v", `${this.specs}:/specs:ro`,
+        "-v", `${this.prose}:/prose:ro`, "-v", `${this.state}:/state`,
+        "-w", "/work", "-e", "CI=1", "-e", "DEBIAN_FRONTEND=noninteractive",
+        image, "sleep", "infinity",
+      ],
+      600_000,
+    );
+    if (r.code !== 0) throw new Error(`failed to start sandbox: ${r.stderr}`);
   }
 
   async exec(command: string): Promise<string> {
@@ -53,9 +65,16 @@ export class Sandbox {
     return out;
   }
 
+  /** Give the host user ownership of root-created files so they can be read/removed. */
+  async chown() {
+    if (process.getuid && process.getgid) {
+      await run(["exec", this.name, "chown", "-R", `${process.getuid()}:${process.getgid()}`, "/work", "/state"], 300_000);
+    }
+  }
+
   async destroy() {
+    await this.chown().catch(() => {});
     await run(["rm", "-f", this.name], 30_000);
-    // files written by root inside the container may need the container to chown first
-    await fs.rm(this.dir, { recursive: true, force: true }).catch(() => {});
+    await fs.rm(this.base, { recursive: true, force: true }).catch(() => {});
   }
 }

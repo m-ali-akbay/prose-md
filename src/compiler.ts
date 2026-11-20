@@ -2,46 +2,73 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import OpenAI from "openai";
 import { diffMds, hasChanges } from "./diff.js";
-import {
-  OUT_DIR, hash, loadSnapshot, readMds, readOutputs, saveSnapshot,
-} from "./snapshot.js";
 import { Sandbox } from "./sandbox.js";
-import { BuildState, makeToolDefs, runTool } from "./tools.js";
+import { OUT_DIR, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
-export const PROMPT_VERSION = 1;
+export const PROMPT_VERSION = 2;
 
 const SYSTEM = `You are the compiler of "prose": a build system where markdown files are the source code.
-Your job: make the files under out/ implement what the markdown specs describe.
+Your job: make /work (the project's out/ directory) implement what the markdown specs describe.
+
+You have a disposable Docker container where you are root, with network access. You can install anything (apt, npm, pip, ...), generate code, build and test. You only have two tools: bash and finish.
+
+Layout inside the container:
+- /specs   (read-only) all markdown specs, same paths as in the project
+- /prose   (read-only) diff.patch = md changes since the last build; hand-edited.txt = files in /work edited by hand since the last build (may be absent)
+- /state   notes.md = your own notes from the previous build (read and rewrite it)
+- /work    the output. It starts as a copy of the current out/. When you call finish, /work BECOMES out/: new and changed files are written, files missing from /work are deleted. Build artifacts and dependency directories you leave there will be copied too, so clean them up before finishing.
 
 Rules:
 - The markdown files are the only source of truth. Never edit them.
-- Spec files contain no signatures or interfaces; you design those. Keep the design consistent across all outputs.
-- The target language(s), frameworks and layout come from the specs (mentioned in prose in any md file). If none is stated and you cannot reasonably infer one, call ask_user.
-- If specs are ambiguous or contradictory in a way that changes behavior, call ask_user instead of guessing. Do not ask about trivia.
-- Work incrementally: start from the md diff and the existing outputs. Update only what the diff requires; create, update or delete output files as needed. If the target language changes, remove the old outputs.
-- Outputs flagged "[changed since last build]" were edited by hand; preserve their intent unless the specs contradict them.
-- Include whatever the specs imply (tests, build files, README for the output) inside out/.
-- Before finish, call write_notes with concise notes for your future self: project structure, key design decisions, which spec maps to which output files, anything pending. Notes are rewritten in full each time.
-- If run_command is available, you have a disposable Docker container (root, network access, /work = a mirror of out/). Install any toolchain or package you need (apt, npm, pip, ...), build, run the tests you wrote, and fix failures before finishing. Only files you write with write_output are kept; changes made inside the container are scratch. Do not finish with failing tests unless the specs make that unavoidable (then say so in the summary).
-- When done, call finish. Nothing is committed until you do.`;
+- Specs contain no signatures or interfaces; you design those and keep them consistent.
+- The target language(s), frameworks and layout come from the specs (stated in prose in any md file). If none is stated, pick a sensible default and record it in the notes.
+- Work incrementally: start from the diff and the existing /work contents. Change only what the diff requires; create, update or delete files as needed. If the target language changes, remove the old outputs.
+- Files listed in hand-edited.txt were edited by hand; preserve their intent unless the specs contradict them.
+- Include whatever the specs imply (tests, build files, a README for the output) in /work.
+- Build and run the tests you wrote and fix failures before finishing.
+- If the specs are contradictory or too ambiguous to implement without guessing something important, call finish with error set to a short explanation of what the author must fix. Nothing is applied then. Resolve minor ambiguity yourself and mention the assumption in the notes.
+- Before finishing, rewrite /state/notes.md in full: structure, key decisions, assumptions, which spec maps to which files, anything pending. It is for your future self.
+- Nothing is applied until you call finish.`;
+
+const tools: OpenAI.Chat.ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "bash",
+      description: "Run a bash command as root in the container (cwd /work). Installed packages and files persist between calls.",
+      parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "finish",
+      description: "End the build. Without `error`, /work is applied to out/. With `error`, nothing is applied and the build fails.",
+      parameters: {
+        type: "object",
+        properties: {
+          summary: { type: "string", description: "What was built or changed." },
+          error: { type: "string", description: "Set only if the build cannot proceed; explain what the author must fix." },
+        },
+        required: ["summary"],
+      },
+    },
+  },
+];
 
 export interface BuildOptions {
   root: string;
   model: string;
   apiKey: string;
   baseURL: string;
+  image: string;
   maxTurns?: number;
   dry?: boolean;
-  /** Docker image for the sandbox the agent runs commands in */
-  image: string;
-  /** disable the sandbox: the agent can only read/write files */
-  noSandbox?: boolean;
   log?: (s: string) => void;
 }
 
 export type BuildResult =
   | { status: "unchanged" }
-  | { status: "questions"; questions: string[] }
   | { status: "failed"; reason: string }
   | { status: "built"; summary: string; written: string[]; deleted: string[] };
 
@@ -52,115 +79,123 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
   const changes = diffMds(snap.mds, mds);
   if (!hasChanges(changes)) return { status: "unchanged" };
 
-  const current = await readOutputs(o.root);
-  const state: BuildState = {
-    prevOutputs: snap.outputs,
-    outputs: { ...current },
-    mds,
-    changes,
-    notes: snap.notes,
-  };
-
-  let sandbox: Sandbox | undefined;
-  if (!o.noSandbox) {
-    sandbox = await Sandbox.start(o.image, log);
-    state.exec = async (command) => {
-      await sandbox!.sync(state.outputs);
-      return sandbox!.exec(command);
-    };
-  }
-  try {
-    return await agentLoop();
-  } finally {
-    await sandbox?.destroy();
-  }
-
-  async function agentLoop(): Promise<BuildResult> {
-  const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
-  const first = [
-    `Changes since last build: ${changes.added.length} added, ${changes.modified.length} modified, ${changes.deleted.length} deleted md files.`,
-    snap.meta.builtAt ? `Last build: ${snap.meta.builtAt}` : "This is the first build (empty snapshot).",
-    "",
-    "## Notes from the previous build",
-    snap.notes || "(none)",
-    "",
-    "## Spec files",
-    Object.keys(mds).join("\n") || "(none)",
-    "",
-    "## Current output files",
-    Object.entries(current)
-      .map(([f, c]) => (snap.outputs[f] !== undefined && snap.outputs[f] !== hash(c) ? `${f} [changed since last build]` : f))
-      .join("\n") || "(none)",
-    "",
-    "## md diff",
-    changes.patch,
-  ].join("\n");
-
-  const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
-    { role: "system", content: SYSTEM },
-    { role: "user", content: first },
-  ];
-
-  const maxTurns = o.maxTurns ?? 150;
-  let nudged = false;
-  for (let turn = 0; turn < maxTurns && !state.finished && !state.questions; turn++) {
-    if (turn === maxTurns - 15) {
-      messages.push({ role: "user", content: "You are running out of turns. Stop refining, write_notes and call finish within a few turns." });
-    }
-    const res = await client.chat.completions.create({
-      model: o.model,
-      messages,
-      tools: makeToolDefs(!!sandbox),
-    });
-    const msg = res.choices[0].message;
-    messages.push(msg as OpenAI.Chat.ChatCompletionMessageParam);
-    if (msg.content) log(msg.content.trim());
-
-    const calls = (msg.tool_calls ?? []).filter((c) => c.type === "function");
-    if (calls.length === 0) {
-      if (nudged) {
-              return { status: "failed", reason: "model stopped without calling finish or ask_user" };
-      }
-      nudged = true;
-      messages.push({ role: "user", content: "Continue using tools. Call finish when done, or ask_user if blocked." });
-      continue;
-    }
-    for (const c of calls) {
-      let out: string;
-      try {
-        const args = JSON.parse(c.function.arguments || "{}");
-        out = await runTool(state, c.function.name, args);
-        log(`  ${c.function.name}${args.path ? " " + args.path : ""}${args.command ? ": " + args.command : ""}`);
-      } catch (e) {
-        out = `error: ${(e as Error).message}`;
-        log(`  ${c.function.name} -> ${out}`);
-      }
-      messages.push({ role: "tool", tool_call_id: c.id, content: out });
-    }
-  }
-
-  if (state.questions) return { status: "questions", questions: state.questions };
-  if (state.finished === undefined) return { status: "failed", reason: `no finish after ${maxTurns} turns; nothing written` };
-
-  const written = Object.keys(state.outputs).filter((f) => current[f] !== state.outputs[f]);
-  const deleted = Object.keys(current).filter((f) => !(f in state.outputs));
-  if (o.dry) return { status: "built", summary: state.finished, written, deleted };
-
   const outBase = path.join(o.root, OUT_DIR);
-  for (const f of deleted) await fs.rm(path.join(outBase, f), { force: true });
-  for (const f of written) {
-    await fs.mkdir(path.dirname(path.join(outBase, f)), { recursive: true });
-    await fs.writeFile(path.join(outBase, f), state.outputs[f]);
-  }
-  await pruneEmptyDirs(outBase);
+  const current = await readTree(outBase);
+  const handEdited = Object.entries(current)
+    .filter(([f, v]) => snap.outputs[f] !== undefined && snap.outputs[f] !== hash(v.data))
+    .map(([f]) => f);
 
-  await saveSnapshot(o.root, {
-    mds,
-    outputs: Object.fromEntries(Object.entries(state.outputs).map(([f, c]) => [f, hash(c)])),
-    notes: state.notes,
-    meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString() },
-  });
-  return { status: "built", summary: state.finished, written, deleted };
+  const sb = await Sandbox.create();
+  try {
+    // prepare the container's view
+    await fs.mkdir(outBase, { recursive: true });
+    await fs.cp(outBase, sb.work, { recursive: true });
+    for (const [f, c] of Object.entries(mds)) {
+      await fs.mkdir(path.dirname(path.join(sb.specs, f)), { recursive: true });
+      await fs.writeFile(path.join(sb.specs, f), c);
+    }
+    await fs.writeFile(path.join(sb.prose, "diff.patch"), changes.patch);
+    if (handEdited.length) await fs.writeFile(path.join(sb.prose, "hand-edited.txt"), handEdited.join("\n") + "\n");
+    await fs.writeFile(path.join(sb.state, "notes.md"), snap.notes);
+    await sb.start(o.image, log);
+
+    const first = [
+      `Changes since last build: ${changes.added.length} added, ${changes.modified.length} modified, ${changes.deleted.length} deleted md files.`,
+      snap.meta.builtAt ? `Last build: ${snap.meta.builtAt}` : "This is the first build (empty snapshot, empty /work).",
+      "",
+      "## /state/notes.md (from the previous build)",
+      snap.notes || "(none)",
+      "",
+      "## Spec files in /specs",
+      Object.keys(mds).join("\n") || "(none)",
+      "",
+      "## Files in /work",
+      Object.keys(current).join("\n") || "(empty)",
+      "",
+      handEdited.length ? `## Edited by hand since last build\n${handEdited.join("\n")}\n` : "",
+      "## md diff (also in /prose/diff.patch)",
+      changes.patch,
+    ].join("\n");
+
+    const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
+      { role: "system", content: SYSTEM },
+      { role: "user", content: first },
+    ];
+    const client = new OpenAI({ apiKey: o.apiKey, baseURL: o.baseURL });
+    const maxTurns = o.maxTurns ?? 150;
+    let nudged = false;
+    let finished: { summary: string; error?: string } | undefined;
+
+    for (let turn = 0; turn < maxTurns && !finished; turn++) {
+      if (turn === maxTurns - 15) {
+        messages.push({ role: "user", content: "You are running out of turns. Stop refining, update /state/notes.md and call finish within a few turns." });
+      }
+      const res = await client.chat.completions.create({ model: o.model, messages, tools });
+      const msg = res.choices[0].message;
+      messages.push(msg as OpenAI.Chat.ChatCompletionMessageParam);
+      if (msg.content) log(msg.content.trim());
+
+      const calls = (msg.tool_calls ?? []).filter((c) => c.type === "function");
+      if (calls.length === 0) {
+        if (nudged) return { status: "failed", reason: "model stopped without calling finish" };
+        nudged = true;
+        messages.push({ role: "user", content: "Continue using tools. Call finish when done." });
+        continue;
+      }
+      for (const c of calls) {
+        let out: string;
+        try {
+          const args = JSON.parse(c.function.arguments || "{}");
+          if (c.function.name === "bash") {
+            log(`  bash: ${String(args.command).split("\n")[0].slice(0, 160)}`);
+            out = await sb.exec(String(args.command ?? ""));
+          } else if (c.function.name === "finish") {
+            finished = { summary: String(args.summary ?? ""), error: args.error ? String(args.error) : undefined };
+            log("  finish");
+            out = "ok";
+          } else {
+            out = `error: unknown tool ${c.function.name}`;
+          }
+        } catch (e) {
+          out = `error: ${(e as Error).message}`;
+        }
+        messages.push({ role: "tool", tool_call_id: c.id, content: out });
+      }
+    }
+
+    if (!finished) return { status: "failed", reason: `no finish after ${maxTurns} turns; nothing written` };
+    if (finished.error) return { status: "failed", reason: finished.error };
+
+    // apply /work -> out/
+    await sb.chown();
+    const next = await readTree(sb.work);
+    const same = (a: { data: Buffer; mode: number }, b: { data: Buffer; mode: number }) =>
+      a.mode === b.mode && a.data.equals(b.data);
+    const written = Object.keys(next).filter((f) => !current[f] || !same(current[f], next[f]));
+    const deleted = Object.keys(current).filter((f) => !(f in next));
+    if (o.dry) return { status: "built", summary: finished.summary, written, deleted };
+
+    for (const f of deleted) await fs.rm(path.join(outBase, f), { force: true });
+    for (const f of written) {
+      const p = path.join(outBase, f);
+      await fs.mkdir(path.dirname(p), { recursive: true });
+      await fs.rm(p, { force: true });
+      await fs.writeFile(p, next[f].data, { mode: next[f].mode });
+      await fs.chmod(p, next[f].mode);
+    }
+    await pruneEmptyDirs(outBase);
+
+    let notes = snap.notes;
+    try { notes = await fs.readFile(path.join(sb.state, "notes.md"), "utf8"); } catch {}
+    await saveSnapshot(o.root, {
+      mds,
+      outputs: Object.fromEntries(Object.entries(next).map(([f, v]) => [f, hash(v.data)])),
+      notes,
+      meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString() },
+    });
+    return { status: "built", summary: finished.summary, written, deleted };
+  } finally {
+    await sb.destroy();
   }
 }
 
@@ -173,6 +208,6 @@ async function pruneEmptyDirs(dir: string): Promise<boolean> {
       if (!(await pruneEmptyDirs(path.join(dir, e.name)))) empty = false;
     } else empty = false;
   }
-  if (empty) await fs.rmdir(dir).catch(() => {});
+  if (empty && dir.endsWith(OUT_DIR) === false) await fs.rmdir(dir).catch(() => {});
   return empty;
 }

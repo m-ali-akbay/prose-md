@@ -16,9 +16,8 @@ async function loadDotEnv(root: string) {
 
 const HELP = `prose - compile markdown into code
 
-  prose build [--dry] [--no-sandbox]
-                        compile md changes into out/. The agent works in a
-                        root Docker container (build, test, install anything)
+  prose build [--dry]   compile md changes into out/. The agent works in a root
+                        Docker container (build, test, install anything)
   prose status          show md changes since the last build
   prose check           exit 1 if md files changed since the last build (no LLM call)
 
@@ -54,7 +53,6 @@ async function main() {
       model: process.env.PROSE_MODEL ?? "deepseek-chat",
       baseURL: process.env.PROSE_BASE_URL ?? "https://api.deepseek.com",
       dry: flags.includes("--dry"),
-      noSandbox: flags.includes("--no-sandbox"),
       image: process.env.PROSE_IMAGE ?? "ubuntu:24.04",
       log: (s) => console.log(s),
     });
@@ -62,12 +60,8 @@ async function main() {
       case "unchanged":
         console.log("up to date");
         break;
-      case "questions":
-        console.error("\nBuild blocked. Resolve in the md files:");
-        r.questions.forEach((q) => console.error(`  - ${q}`));
-        process.exit(2);
       case "failed":
-        console.error(`\nBuild failed: ${r.reason}`);
+        console.error(`\nBuild failed (nothing written): ${r.reason}`);
         process.exit(1);
       case "built":
         console.log(`\n${r.summary}\n+${r.written.length} written, -${r.deleted.length} deleted${flags.includes("--dry") ? " (dry run)" : ""}`);

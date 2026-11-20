@@ -6,7 +6,7 @@ export const OUT_DIR = "out";
 export const STATE_DIR = ".prose";
 const IGNORED = new Set(["node_modules", STATE_DIR, OUT_DIR, ".git", "dist"]);
 
-export const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+export const hash = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
 
 export interface Snapshot {
   /** md files as of the last successful build (relative path -> content) */
@@ -41,11 +41,16 @@ export async function readMds(root: string): Promise<Record<string, string>> {
   return out;
 }
 
-export async function readOutputs(root: string): Promise<Record<string, string>> {
-  const base = path.join(root, OUT_DIR);
+/** Walk a directory tree: relative path -> content + mode (regular files only). */
+export async function readTree(base: string): Promise<Record<string, { data: Buffer; mode: number }>> {
   const files = await walk(base, base, () => true, false);
-  const out: Record<string, string> = {};
-  for (const f of files) out[f] = await fs.readFile(path.join(base, f), "utf8");
+  const out: Record<string, { data: Buffer; mode: number }> = {};
+  for (const f of files) {
+    const p = path.join(base, f);
+    const st = await fs.lstat(p);
+    if (!st.isFile()) continue;
+    out[f] = { data: await fs.readFile(p), mode: st.mode & 0o777 };
+  }
   return out;
 }
 
