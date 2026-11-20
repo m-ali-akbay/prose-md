@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { build, type Issue } from "./compiler.js";
 import { diffMds, hasChanges } from "./diff.js";
-import { loadSnapshot, readMds } from "./snapshot.js";
+import { OUT_DIR, drift, loadSnapshot, readMds, readTree } from "./snapshot.js";
 
 async function loadDotEnv(root: string) {
   try {
@@ -16,8 +16,13 @@ async function loadDotEnv(root: string) {
 
 const HELP = `prose - compile markdown into code
 
-  prose build [--dry]   compile md changes into out/. The agent works in a root
-                        Docker container (build, test, install anything)
+  prose build [--dry] [--param key=value]... ["instruction"]
+                        compile md changes into out/. The agent works in a root
+                        Docker container (build, test, install anything).
+                        --param: build parameters given to the agent (target, env, ...).
+                          Remembered across builds; changing one triggers a rebuild;
+                          --param key= removes it.
+                        "instruction": free text for this build only; forces a build.
   prose status          show md changes since the last build
   prose check           exit 1 if md files changed since the last build (no LLM call)
 
@@ -32,16 +37,38 @@ const printIssues = (issues: Issue[]) => {
 };
 
 async function main() {
-  const [cmd = "help", ...flags] = process.argv.slice(2);
+  const [cmd = "help", ...rest] = process.argv.slice(2);
+  const flags: string[] = [];
+  const params: Record<string, string> = {};
+  const words: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--param" || a.startsWith("--param=")) {
+      const kv = a === "--param" ? rest[++i] ?? "" : a.slice("--param=".length);
+      const eq = kv.indexOf("=");
+      if (eq < 1) {
+        console.error(`bad --param "${kv}", expected key=value`);
+        process.exit(1);
+      }
+      params[kv.slice(0, eq)] = kv.slice(eq + 1);
+    } else if (a.startsWith("--")) flags.push(a);
+    else words.push(a);
+  }
   const root = process.cwd();
   await loadDotEnv(root);
 
   if (cmd === "status" || cmd === "check") {
-    const changes = diffMds((await loadSnapshot(root)).mds, await readMds(root));
+    const snap = await loadSnapshot(root);
+    const changes = diffMds(snap.mds, await readMds(root));
+    const d = drift(snap.outputs, await readTree(path.join(root, OUT_DIR)));
+    const hand = [...d.modified.map((f) => `modified ${f}`), ...d.missing.map((f) => `deleted  ${f}`), ...d.extra.map((f) => `added    ${f}`)];
+    const stale = hasChanges(changes) || hand.length > 0;
     if (cmd === "status") {
-      console.log(hasChanges(changes) ? changes.patch : "up to date");
-    } else if (hasChanges(changes)) {
-      console.error("stale: md files changed since last build");
+      if (hasChanges(changes)) console.log(changes.patch);
+      if (hand.length) console.log(`out/ was changed by hand (a build will discard this):\n  ${hand.join("\n  ")}`);
+      if (!stale) console.log("up to date");
+    } else if (stale) {
+      console.error(hasChanges(changes) ? "stale: md files changed since last build" : "out/ was changed by hand since last build");
       process.exit(1);
     }
     return;
@@ -59,6 +86,8 @@ async function main() {
       model: process.env.PROSE_MODEL ?? "deepseek-chat",
       baseURL: process.env.PROSE_BASE_URL ?? "https://api.deepseek.com",
       dry: flags.includes("--dry"),
+      params,
+      instruction: words.join(" ").trim() || undefined,
       image: process.env.PROSE_IMAGE ?? "ubuntu:24.04",
       log: (s) => console.log(s),
     });

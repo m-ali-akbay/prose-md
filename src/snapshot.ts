@@ -14,7 +14,7 @@ export interface Snapshot {
   mds: Record<string, string>;
   /** output files as of the last successful build (relative to out/ -> sha256) */
   outputs: Record<string, string>;
-  meta: { model?: string; promptVersion?: number; builtAt?: string };
+  meta: { model?: string; promptVersion?: number; builtAt?: string; params?: Record<string, string> };
 }
 
 async function walk(dir: string, base: string, filter: (p: string) => boolean, skip: boolean): Promise<string[]> {
@@ -52,6 +52,15 @@ export async function readTree(base: string): Promise<Record<string, { data: Buf
     out[f] = { data: await fs.readFile(p), mode: st.mode & 0o777 };
   }
   return out;
+}
+
+/** How out/ differs from what the last build produced (i.e. hand edits). */
+export function drift(lock: Record<string, string>, current: Record<string, { data: Buffer }>) {
+  return {
+    modified: Object.keys(current).filter((f) => f in lock && lock[f] !== hash(current[f].data)),
+    missing: Object.keys(lock).filter((f) => !(f in current)),
+    extra: Object.keys(current).filter((f) => !(f in lock)),
+  };
 }
 
 export async function loadSnapshot(root: string): Promise<Snapshot> {
