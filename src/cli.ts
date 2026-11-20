@@ -16,14 +16,15 @@ async function loadDotEnv(root: string) {
 
 const HELP = `prose - compile markdown into code
 
-  prose build [--dry] [--verify]
-                        compile md changes into out/; --verify lets the agent run
-                        shell commands (tests) in a scratch dir
+  prose build [--dry] [--no-sandbox]
+                        compile md changes into out/. The agent works in a
+                        root Docker container (build, test, install anything)
   prose status          show md changes since the last build
   prose check           exit 1 if md files changed since the last build (no LLM call)
 
 env: DEEPSEEK_API_KEY (or PROSE_API_KEY), PROSE_MODEL (default deepseek-chat),
-     PROSE_BASE_URL (default https://api.deepseek.com)`;
+     PROSE_BASE_URL (default https://api.deepseek.com),
+     PROSE_IMAGE (sandbox image, default ubuntu:24.04)`;
 
 async function main() {
   const [cmd = "help", ...flags] = process.argv.slice(2);
@@ -53,7 +54,8 @@ async function main() {
       model: process.env.PROSE_MODEL ?? "deepseek-chat",
       baseURL: process.env.PROSE_BASE_URL ?? "https://api.deepseek.com",
       dry: flags.includes("--dry"),
-      verify: flags.includes("--verify"),
+      noSandbox: flags.includes("--no-sandbox"),
+      image: process.env.PROSE_IMAGE ?? "ubuntu:24.04",
       log: (s) => console.log(s),
     });
     switch (r.status) {

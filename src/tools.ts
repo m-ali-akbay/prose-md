@@ -15,7 +15,7 @@ export interface BuildState {
 
 const runCommandDef: [string, string, Record<string, string>] = [
   "run_command",
-  "Run a shell command (build, tests, ...) in a scratch copy of the current staged outputs (root = out/). Use it to verify your work; the scratch dir persists between calls within this build, so installed dependencies are kept. Returns exit code and output.",
+  "Run a bash command as root in a disposable Docker container with network access. /work mirrors the current staged outputs (out/). State (installed packages, node_modules) persists between calls within this build. Returns exit code and output.",
   { command: "string" },
 ];
 
