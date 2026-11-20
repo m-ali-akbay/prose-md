@@ -3,11 +3,13 @@
 Markdown is the source code. An LLM agent compiles your `.md` specs into `out/`.
 
 ```
-npm install
+npm install -g prose-md      # installs the `prose` command
 export DEEPSEEK_API_KEY=...   # or put it in a .env file
 cd my-project                 # a directory containing .md specs
-npx tsx /path/to/prose/src/cli.ts build
+prose build
 ```
+
+From a checkout instead: `npm install && npx tsx src/cli.ts build`.
 
 Requires Docker. The target language, frameworks and layout come from the specs themselves, stated in prose.
 
@@ -77,8 +79,7 @@ Commit `.prose/` and `out/` together with the specs, then in CI, for example:
 ```yaml
 - uses: actions/checkout@v4
 - uses: actions/setup-node@v4
-- run: npm ci   # in the prose checkout
-- run: npx tsx /path/to/prose/src/cli.ts check
+- run: npx prose-md check
 ```
 
 ## History

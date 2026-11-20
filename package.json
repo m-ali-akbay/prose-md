@@ -1,13 +1,14 @@
 {
-  "name": "prose",
+  "name": "prose-md",
   "version": "0.1.0",
-  "description": "Compile markdown specs into code with an LLM agent.",
+  "description": "Markdown is the source code: an LLM agent compiles your .md specs into code, cached and checkable in CI.",
   "type": "module",
   "bin": {
     "prose": "dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
+    "prepublishOnly": "npm run build",
     "prose": "tsx src/cli.ts"
   },
   "dependencies": {
@@ -19,5 +20,28 @@
     "@types/node": "^26.6.6",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
-  }
+  },
+  "license": "MIT",
+  "author": "Muhammet Ali AKBAY",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/m-ali-akbay/md-code.git"
+  },
+  "homepage": "https://github.com/m-ali-akbay/md-code#readme",
+  "keywords": [
+    "markdown",
+    "llm",
+    "compiler",
+    "codegen",
+    "ai",
+    "spec"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
 }
