@@ -4,7 +4,8 @@ import path from "node:path";
 
 export const OUT_DIR = "out";
 export const STATE_DIR = ".prose";
-const IGNORED = new Set(["node_modules", STATE_DIR, OUT_DIR, ".git", "dist"]);
+export const STAGING_DIR = ".prose-staging";
+const IGNORED = new Set(["node_modules", STATE_DIR, STAGING_DIR, OUT_DIR, ".git", "dist"]);
 
 export const hash = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
 
@@ -72,9 +73,8 @@ export async function loadSnapshot(root: string): Promise<Snapshot> {
   return snap;
 }
 
-export async function saveSnapshot(root: string, snap: Snapshot): Promise<void> {
-  const state = path.join(root, STATE_DIR);
-  await fs.rm(path.join(state, "md"), { recursive: true, force: true });
+/** Write a snapshot into `state` (an empty/new directory). */
+export async function saveSnapshot(state: string, snap: Snapshot): Promise<void> {
   for (const [f, content] of Object.entries(snap.mds)) {
     const p = path.join(state, "md", f);
     await fs.mkdir(path.dirname(p), { recursive: true });

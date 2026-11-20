@@ -3,7 +3,7 @@ import path from "node:path";
 import OpenAI from "openai";
 import { diffMds, hasChanges } from "./diff.js";
 import { Sandbox } from "./sandbox.js";
-import { OUT_DIR, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
+import { OUT_DIR, STAGING_DIR, STATE_DIR, hash, loadSnapshot, readMds, readTree, saveSnapshot } from "./snapshot.js";
 
 export const PROMPT_VERSION = 2;
 
@@ -74,6 +74,7 @@ export type BuildResult =
 
 export async function build(o: BuildOptions): Promise<BuildResult> {
   const log = o.log ?? (() => {});
+  await recover(o.root);
   const snap = await loadSnapshot(o.root);
   const mds = await readMds(o.root);
   const changes = diffMds(snap.mds, mds);
@@ -175,39 +176,53 @@ export async function build(o: BuildOptions): Promise<BuildResult> {
     const deleted = Object.keys(current).filter((f) => !(f in next));
     if (o.dry) return { status: "built", summary: finished.summary, written, deleted };
 
-    for (const f of deleted) await fs.rm(path.join(outBase, f), { force: true });
-    for (const f of written) {
-      const p = path.join(outBase, f);
-      await fs.mkdir(path.dirname(p), { recursive: true });
-      await fs.rm(p, { force: true });
-      await fs.writeFile(p, next[f].data, { mode: next[f].mode });
-      await fs.chmod(p, next[f].mode);
-    }
-    await pruneEmptyDirs(outBase);
-
     let notes = snap.notes;
     try { notes = await fs.readFile(path.join(sb.state, "notes.md"), "utf8"); } catch {}
-    await saveSnapshot(o.root, {
+
+    // Stage the complete new out/ and .prose/ side by side, then swap both in.
+    const staging = path.join(o.root, STAGING_DIR);
+    await fs.rm(staging, { recursive: true, force: true });
+    await fs.mkdir(path.join(staging, "out"), { recursive: true });
+    for (const [f, v] of Object.entries(next)) {
+      const p = path.join(staging, "out", f);
+      await fs.mkdir(path.dirname(p), { recursive: true });
+      await fs.writeFile(p, v.data);
+      await fs.chmod(p, v.mode);
+    }
+    await saveSnapshot(path.join(staging, "state"), {
       mds,
       outputs: Object.fromEntries(Object.entries(next).map(([f, v]) => [f, hash(v.data)])),
       notes,
       meta: { model: o.model, promptVersion: PROMPT_VERSION, builtAt: new Date().toISOString() },
     });
+    const stateDir = path.join(o.root, STATE_DIR);
+    await fs.rm(path.join(staging, "old-out"), { recursive: true, force: true });
+    await fs.rename(outBase, path.join(staging, "old-out")).catch(() => {});
+    await fs.rename(path.join(staging, "out"), outBase);
+    await fs.rename(stateDir, path.join(staging, "old-state")).catch(() => {});
+    await fs.rename(path.join(staging, "state"), stateDir);
+    await fs.rm(staging, { recursive: true, force: true });
     return { status: "built", summary: finished.summary, written, deleted };
   } finally {
     await sb.destroy();
   }
 }
 
-async function pruneEmptyDirs(dir: string): Promise<boolean> {
-  let entries;
-  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return true; }
-  let empty = true;
-  for (const e of entries) {
-    if (e.isDirectory()) {
-      if (!(await pruneEmptyDirs(path.join(dir, e.name)))) empty = false;
-    } else empty = false;
+/** Finish or undo a swap that was interrupted by a crash. */
+async function recover(root: string) {
+  const staging = path.join(root, STAGING_DIR);
+  const exists = (p: string) => fs.stat(p).then(() => true, () => false);
+  if (!(await exists(staging))) return;
+  const out = path.join(root, OUT_DIR);
+  const state = path.join(root, STATE_DIR);
+  // Interrupted mid-swap: put the previous consistent pair back.
+  if (await exists(path.join(staging, "old-out"))) {
+    await fs.rm(out, { recursive: true, force: true });
+    await fs.rename(path.join(staging, "old-out"), out);
   }
-  if (empty && dir.endsWith(OUT_DIR) === false) await fs.rmdir(dir).catch(() => {});
-  return empty;
+  if (await exists(path.join(staging, "old-state"))) {
+    await fs.rm(state, { recursive: true, force: true });
+    await fs.rename(path.join(staging, "old-state"), state);
+  }
+  await fs.rm(staging, { recursive: true, force: true });
 }
